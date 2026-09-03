@@ -1,0 +1,7 @@
+# Build output
+/ompool
+/dist/
+
+# Local files
+.env
+*.log
