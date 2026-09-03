@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+
+set -u
+
+repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+binary="$repo_dir/.tmp/ompool-dev"
+build_cache="$repo_dir/.tmp/go-build"
+watcher_pid=""
+app_pid=""
+reload_count=0
+
+cleanup() {
+  [[ -n "$watcher_pid" ]] && kill "$watcher_pid" 2>/dev/null || true
+  [[ -n "$app_pid" ]] && kill "$app_pid" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+mkdir -p "$repo_dir/.tmp"
+mkdir -p "$build_cache"
+export GOCACHE="$build_cache"
+cd "$repo_dir"
+
+while true; do
+	if ! go build -o "$binary" .; then
+    printf '\nompool: build failed; waiting for another change...\n' >&2
+    inotifywait -q -r -e close_write,create,delete,move --include '\.go$' "$repo_dir"
+    continue
+	fi
+
+	reload_count=$((reload_count + 1))
+	printf '\033[2J\033[Hompool dev · reload #%d · %s\n' "$reload_count" "$(date +%H:%M:%S)"
+
+	inotifywait -q -r -e close_write,create,delete,move --include '\.go$' "$repo_dir" &
+  watcher_pid=$!
+  "$binary" "$@" &
+  app_pid=$!
+
+  wait -n -p finished_pid "$watcher_pid" "$app_pid"
+  if [[ "$finished_pid" == "$app_pid" ]]; then
+    kill "$watcher_pid" 2>/dev/null || true
+    wait "$watcher_pid" 2>/dev/null || true
+    exit 0
+  fi
+
+  kill "$app_pid" 2>/dev/null || true
+  wait "$app_pid" 2>/dev/null || true
+  watcher_pid=""
+  app_pid=""
+	printf '\033[2J\033[Hrebuilding ompool...\n'
+done

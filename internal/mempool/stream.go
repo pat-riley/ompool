@@ -12,6 +12,8 @@ import (
 
 type LiveStats struct {
 	VBytesPerSecond float64 `json:"vBytesPerSecond"`
+	HasFlow         bool
+	Transactions    []Transaction `json:"transactions"`
 }
 
 func (c *Client) StreamStats(ctx context.Context) <-chan LiveStats {
@@ -53,10 +55,24 @@ func (c *Client) streamOnce(ctx context.Context, out chan<- LiveStats) error {
 	if err := wsjson.Write(ctx, conn, want); err != nil {
 		return err
 	}
+	if err := wsjson.Write(ctx, conn, map[string]any{"track-mempool-txids": true}); err != nil {
+		return err
+	}
 	for {
-		var stats LiveStats
-		if err := wsjson.Read(ctx, conn, &stats); err != nil {
+		var payload struct {
+			VBytesPerSecond *float64      `json:"vBytesPerSecond"`
+			Transactions    []Transaction `json:"transactions"`
+		}
+		if err := wsjson.Read(ctx, conn, &payload); err != nil {
 			return err
+		}
+		if payload.VBytesPerSecond == nil && len(payload.Transactions) == 0 {
+			continue
+		}
+		stats := LiveStats{Transactions: payload.Transactions}
+		if payload.VBytesPerSecond != nil {
+			stats.VBytesPerSecond = *payload.VBytesPerSecond
+			stats.HasFlow = true
 		}
 		select {
 		case out <- stats:

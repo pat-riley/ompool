@@ -53,6 +53,9 @@ type model struct {
 	liveStop    context.CancelFunc
 	activity    []activitySample
 	blockScroll int
+	txPulse     int
+	newTXIDs    map[string]struct{}
+	pendingTX   []mempool.Transaction
 	loading     bool
 	err         error
 	width       int
@@ -98,6 +101,7 @@ type overviewMsg struct {
 type refreshMsg time.Time
 type liveStatsMsg mempool.LiveStats
 type liveStreamClosedMsg struct{}
+type txPulseMsg struct{}
 
 func (m model) Init() tea.Cmd {
 	if m.screen == moduleScreen && m.active.command == "overview" {
@@ -142,8 +146,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, scheduleRefresh()
 	case liveStatsMsg:
 		now := time.Now()
-		m.activity = append(m.activity, activitySample{at: now, value: msg.VBytesPerSecond})
-		cutoff := now.Add(-2 * time.Hour)
+		if msg.HasFlow {
+			m.activity = append(m.activity, activitySample{at: now, value: msg.VBytesPerSecond})
+		}
+		if len(msg.Transactions) > 0 {
+			m.pendingTX = enqueueTransactions(m.pendingTX, msg.Transactions, m.overview.Recent, 40)
+			if m.txPulse == 0 {
+				m.activateNextTransaction()
+			}
+		}
+		cutoff := now.Add(-2 * time.Minute)
 		first := 0
 		for first < len(m.activity) && m.activity[first].at.Before(cutoff) {
 			first++
@@ -151,7 +163,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if first > 0 {
 			m.activity = m.activity[first:]
 		}
+		if m.txPulse > 0 {
+			return m, tea.Batch(waitForLiveStats(m.live), scheduleTXPulse())
+		}
 		return m, waitForLiveStats(m.live)
+	case txPulseMsg:
+		if m.txPulse > 0 {
+			m.txPulse--
+		}
+		if m.txPulse == 0 {
+			m.newTXIDs = nil
+			m.activateNextTransaction()
+		}
+		if m.txPulse > 0 {
+			return m, scheduleTXPulse()
+		}
+		return m, nil
 	case liveStreamClosedMsg:
 		return m, nil
 	case refreshMsg:
@@ -234,6 +261,66 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+func mergeRecentTransactions(incoming, existing []mempool.Transaction, limit int) []mempool.Transaction {
+	merged := make([]mempool.Transaction, 0, min(limit, len(incoming)+len(existing)))
+	seen := make(map[string]struct{}, len(incoming)+len(existing))
+	for _, group := range [][]mempool.Transaction{incoming, existing} {
+		for _, tx := range group {
+			if tx.TxID == "" {
+				continue
+			}
+			if _, exists := seen[tx.TxID]; exists {
+				continue
+			}
+			seen[tx.TxID] = struct{}{}
+			merged = append(merged, tx)
+			if len(merged) == limit {
+				return merged
+			}
+		}
+	}
+	return merged
+}
+
+func enqueueTransactions(queue, incoming, existing []mempool.Transaction, limit int) []mempool.Transaction {
+	seen := make(map[string]struct{}, len(queue)+len(existing))
+	for _, tx := range queue {
+		seen[tx.TxID] = struct{}{}
+	}
+	for _, tx := range existing {
+		seen[tx.TxID] = struct{}{}
+	}
+	for _, tx := range incoming {
+		if tx.TxID == "" {
+			continue
+		}
+		if _, exists := seen[tx.TxID]; exists {
+			continue
+		}
+		seen[tx.TxID] = struct{}{}
+		queue = append(queue, tx)
+		if len(queue) == limit {
+			break
+		}
+	}
+	return queue
+}
+
+func (m *model) activateNextTransaction() {
+	if len(m.pendingTX) == 0 {
+		return
+	}
+	tx := m.pendingTX[0]
+	m.pendingTX = m.pendingTX[1:]
+	m.overview.Recent = mergeRecentTransactions([]mempool.Transaction{tx}, m.overview.Recent, 10)
+	m.newTXIDs = map[string]struct{}{tx.TxID: {}}
+	m.txPulse = 5
+}
+
+func scheduleTXPulse() tea.Cmd {
+	return tea.Tick(90*time.Millisecond, func(time.Time) tea.Msg { return txPulseMsg{} })
+}
+
 func (m model) maxBlockScroll() int {
 	panelHeight := max(18, m.height-15)
 	contentLines := (len(m.overview.ProjectedBlocks)+len(m.overview.Blocks))*7 + 1
@@ -244,7 +331,7 @@ func (m model) View() tea.View {
 	var view tea.View
 	if m.screen == moduleScreen {
 		if m.active.command == "overview" {
-			view = tea.NewView(renderOverview(m.overview, m.activity, m.loading, m.err, m.width, m.height, m.blockScroll))
+			view = tea.NewView(renderOverview(m.overview, m.activity, m.loading, m.err, m.width, m.height, m.blockScroll, m.txPulse, m.newTXIDs))
 		} else {
 			view = tea.NewView(renderModule(m.active))
 		}
@@ -288,7 +375,7 @@ var (
 	panelStyle = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(panel).Padding(0, 1)
 )
 
-func renderOverview(snapshot mempool.Overview, activity []activitySample, loading bool, err error, width, height, blockScroll int) string {
+func renderOverview(snapshot mempool.Overview, activity []activitySample, loading bool, err error, width, height, blockScroll, txPulse int, newTXIDs map[string]struct{}) string {
 	if width < 72 {
 		width = 72
 	}
@@ -304,7 +391,8 @@ func renderOverview(snapshot mempool.Overview, activity []activitySample, loadin
 			message = "Could not load network data\n" + err.Error()
 		}
 		body := lipgloss.NewStyle().Foreground(dim).PaddingTop(3).Render(message)
-		return lipgloss.NewStyle().Width(width).Height(height).Padding(1, 2).Render(header + "\n" + body + "\n\nEsc modules  q quit")
+		footer := labelText.Width(contentWidth).Render("Esc modules  ·  q quit  ·  data: mempool.space")
+		return renderWithAnchoredFooter(header+"\n"+body, footer, width, height)
 	}
 
 	block := snapshot.Blocks[0]
@@ -317,13 +405,24 @@ func renderOverview(snapshot mempool.Overview, activity []activitySample, loadin
 
 	metricRow := renderMetricRow(metrics, contentWidth)
 
-	mainGrid := renderMainGrid(snapshot.ProjectedBlocks, snapshot.Blocks, activity, snapshot.Difficulty, contentWidth, max(18, height-15), blockScroll)
+	mainGrid := renderMainGrid(snapshot.ProjectedBlocks, snapshot.Blocks, activity, snapshot.Difficulty, snapshot.Recent, snapshot.Prices, snapshot.Fees, contentWidth, max(18, height-15), blockScroll, txPulse, newTXIDs)
 
-	footer := labelText.Render(fmt.Sprintf("fees  30m %d  ·  1h %d  ·  economy %d sat/vB", snapshot.Fees.HalfHour, snapshot.Fees.Hour, snapshot.Fees.Economy))
-	footer += "\n" + labelText.Render("Esc modules  ·  q quit  ·  data: mempool.space")
+	footer := labelText.Render("Esc modules  ·  q quit  ·  data: mempool.space")
 
-	content := strings.Join([]string{header, metricRow, mainGrid, footer}, "\n\n")
-	return lipgloss.NewStyle().Width(width).Height(height).Padding(1, 2).Render(content)
+	dashboard := strings.Join([]string{header, metricRow, mainGrid}, "\n\n")
+	return renderWithAnchoredFooter(dashboard, labelText.Width(contentWidth).Render(footer), width, height)
+}
+
+func renderWithAnchoredFooter(body, footer string, width, height int) string {
+	// Top padding is retained, but the bottom padding is deliberately zero so
+	// the status line occupies the terminal's final row.
+	innerHeight := max(1, height-1)
+	footerHeight := max(1, lipgloss.Height(footer))
+	bodyHeight := max(1, innerHeight-footerHeight)
+	body = lipgloss.NewStyle().MaxHeight(bodyHeight).Render(body)
+	spacer := max(0, bodyHeight-lipgloss.Height(body))
+	content := body + strings.Repeat("\n", spacer) + "\n" + footer
+	return lipgloss.NewStyle().Width(width).Height(height).Padding(1, 2, 0, 2).Render(content)
 }
 
 func renderMetricRow(metrics []struct{ label, value string }, width int) string {
@@ -364,7 +463,7 @@ func renderStatusHeader(snapshot mempool.Overview, loading bool, width int) stri
 
 func renderBlockStack(projected []mempool.ProjectedBlock, confirmed []mempool.Block, width, height, scroll int) string {
 	title := headerText.Render("MEMPOOL BLOCKS") + "  " + labelText.Render("↑/↓ scroll")
-	cardWidth := width - 8
+	cardWidth := width - 4
 	cardHeight := 5
 	items := make([]string, 0, len(projected)+len(confirmed)+1)
 	for _, b := range projected {
@@ -372,18 +471,23 @@ func renderBlockStack(projected []mempool.ProjectedBlock, confirmed []mempool.Bl
 			labelText.Render("median fee") + "\n\n" +
 			headerText.Render(formatBytes(int64(b.BlockVSize), "vB")) + "  " +
 			labelText.Render(formatInt(int64(b.TxCount))+" tx")
-		items = append(items, panelStyle.Width(cardWidth).Height(cardHeight).BorderForeground(orange).Render(body))
+		items = append(items, panelStyle.Width(cardWidth).Height(cardHeight).BorderForeground(dim).Render(body))
 	}
 
 	dividerWidth := max(8, cardWidth-19)
 	divider := labelText.Render(strings.Repeat("─", dividerWidth/2) + " CONFIRMED " + strings.Repeat("─", dividerWidth-dividerWidth/2))
 	items = append(items, divider)
 	for _, b := range confirmed {
+		pool := b.Extras.Pool.Name
+		if pool == "" {
+			pool = "Unknown pool"
+		}
 		body := valueText.Render("#"+formatInt(b.Height)) + "\n" +
-			labelText.Render(age(b.Timestamp)) + "\n\n" +
+			headerText.Render(pool) + "\n" +
+			labelText.Render(age(b.Timestamp)) + "\n" +
 			headerText.Render(formatInt(int64(b.TxCount))+" tx") + "  " +
 			labelText.Render(formatBytes(b.Size, "B"))
-		items = append(items, panelStyle.Width(cardWidth).Height(cardHeight).Render(body))
+		items = append(items, panelStyle.Width(cardWidth).Height(cardHeight).BorderForeground(orange).Render(body))
 	}
 
 	lines := strings.Split(lipgloss.JoinVertical(lipgloss.Left, items...), "\n")
@@ -396,25 +500,16 @@ func renderBlockStack(projected []mempool.ProjectedBlock, confirmed []mempool.Bl
 	return panelStyle.Width(width).Height(height - 2).Render(content)
 }
 
-func renderMainGrid(projected []mempool.ProjectedBlock, confirmed []mempool.Block, activity []activitySample, difficulty mempool.DifficultyAdjustment, width, height, scroll int) string {
+func renderMainGrid(projected []mempool.ProjectedBlock, confirmed []mempool.Block, activity []activitySample, difficulty mempool.DifficultyAdjustment, recent []mempool.Transaction, prices mempool.Prices, fees mempool.Fees, width, height, scroll, txPulse int, newTXIDs map[string]struct{}) string {
 	gap := 2
 	leftWidth := min(34, max(28, width/3))
 	rightWidth := width - gap - leftWidth
 	left := renderBlockStack(projected, confirmed, leftWidth, height, scroll)
-	right := renderActivityAndDifficulty(activity, difficulty, rightWidth, height)
+	right := renderActivityAndDifficulty(activity, difficulty, recent, prices, fees, confirmed, rightWidth, height, txPulse, newTXIDs)
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, strings.Repeat(" ", gap), right)
 }
 
-func renderActivityAndDifficulty(activity []activitySample, difficulty mempool.DifficultyAdjustment, width, height int) string {
-	chartWidth := max(12, width-4)
-	chart := renderActivityChart(activity, chartWidth, 5)
-	latest := 0.0
-	if len(activity) > 0 {
-		latest = activity[len(activity)-1].value
-	}
-	activityBody := headerText.Render("INCOMING TRANSACTION FLOW") + "  " + valueText.Render(fmt.Sprintf("%.0f vB/s", latest)) + "\n\n" + chart
-	activityPanel := panelStyle.Width(width).Render(activityBody)
-
+func renderActivityAndDifficulty(activity []activitySample, difficulty mempool.DifficultyAdjustment, recent []mempool.Transaction, prices mempool.Prices, fees mempool.Fees, blocks []mempool.Block, width, height, txPulse int, newTXIDs map[string]struct{}) string {
 	barWidth := max(10, width-6)
 	filled := int(math.Round(math.Max(0, math.Min(100, difficulty.ProgressPercent)) / 100 * float64(barWidth)))
 	bar := valueText.Render(strings.Repeat("█", filled)) + labelText.Render(strings.Repeat("░", barWidth-filled))
@@ -423,44 +518,240 @@ func renderActivityAndDifficulty(activity []activitySample, difficulty mempool.D
 		valueText.Render(fmt.Sprintf("%.1f%%", difficulty.ProgressPercent)) + labelText.Render(" through epoch") + "\n" +
 		labelText.Render(fmt.Sprintf("estimate %s  ·  %s blocks left", change, formatInt(int64(difficulty.RemainingBlocks))))
 	difficultyPanel := panelStyle.Width(width).Render(difficultyBody)
+	transactionsPanel := renderRecentTransactions(recent, prices.USD, width, txPulse, newTXIDs)
+	feePanel := renderFeeMarket(fees, width)
+	networkPanel := renderNetworkPulse(blocks, activity, width)
 
-	return lipgloss.JoinVertical(lipgloss.Left, activityPanel, difficultyPanel)
+	chartWidth := max(12, width-4)
+	chart := renderActivityChart(activity, chartWidth, 5)
+	latest := 0.0
+	if len(activity) > 0 {
+		latest = activity[len(activity)-1].value
+	}
+	activityBody := headerText.Render("INCOMING TRANSACTION FLOW") + "  " + valueText.Render(fmt.Sprintf("%.0f vB/s", latest)) + "  " + labelText.Render("2 min / 15 sec") + "\n\n" + chart
+	activityPanel := panelStyle.Width(width).Render(activityBody)
+
+	return lipgloss.JoinVertical(lipgloss.Left, activityPanel, difficultyPanel, transactionsPanel, feePanel, networkPanel)
+}
+
+func renderFeeMarket(fees mempool.Fees, width int) string {
+	metrics := []struct{ label, value string }{
+		{"NEXT BLOCK", fmt.Sprintf("%d", fees.Fastest)},
+		{"30 MIN", fmt.Sprintf("%d", fees.HalfHour)},
+		{"1 HOUR", fmt.Sprintf("%d", fees.Hour)},
+		{"ECONOMY", fmt.Sprintf("%d", fees.Economy)},
+		{"MINIMUM", fmt.Sprintf("%.1f", fees.Minimum)},
+	}
+	innerWidth := width - 4
+	columnWidth := innerWidth / len(metrics)
+	var labels, values strings.Builder
+	for i, metric := range metrics {
+		cellWidth := columnWidth
+		if i == len(metrics)-1 {
+			cellWidth = innerWidth - columnWidth*(len(metrics)-1)
+		}
+		labels.WriteString(fmt.Sprintf("%-*s", cellWidth, metric.label))
+		values.WriteString(fmt.Sprintf("%-*s", cellWidth, metric.value+" sat/vB"))
+	}
+	body := headerText.Render("FEE MARKET") + "\n" + labelText.Render(labels.String()) + "\n" + valueText.Render(values.String())
+	return panelStyle.Width(width).Render(body)
+}
+
+func renderNetworkPulse(blocks []mempool.Block, activity []activitySample, width int) string {
+	flow := 0.0
+	if len(activity) > 0 {
+		flow = activity[len(activity)-1].value
+	}
+
+	averageInterval := time.Duration(0)
+	if len(blocks) > 1 {
+		span := blocks[0].Timestamp - blocks[len(blocks)-1].Timestamp
+		if span > 0 {
+			averageInterval = time.Duration(span/int64(len(blocks)-1)) * time.Second
+		}
+	}
+	confirmedTX := int64(0)
+	for _, block := range blocks {
+		confirmedTX += int64(block.TxCount)
+	}
+	latestAge := "waiting"
+	if len(blocks) > 0 {
+		latestAge = age(blocks[0].Timestamp)
+	}
+	interval := "waiting"
+	if averageInterval > 0 {
+		interval = fmt.Sprintf("%dm %02ds", int(averageInterval.Minutes()), int(averageInterval.Seconds())%60)
+	}
+
+	metrics := []struct{ label, value string }{
+		{"LIVE FLOW", fmt.Sprintf("%.0f vB/s", flow)},
+		{"LAST BLOCK", latestAge},
+		{"AVG INTERVAL", interval},
+		{fmt.Sprintf("TX / %d BLOCKS", len(blocks)), formatInt(confirmedTX)},
+	}
+	innerWidth := width - 4
+	columnWidth := innerWidth / len(metrics)
+	var labels, values strings.Builder
+	for i, metric := range metrics {
+		cellWidth := columnWidth
+		if i == len(metrics)-1 {
+			cellWidth = innerWidth - columnWidth*(len(metrics)-1)
+		}
+		labels.WriteString(fmt.Sprintf("%-*s", cellWidth, metric.label))
+		values.WriteString(fmt.Sprintf("%-*s", cellWidth, metric.value))
+	}
+	body := headerText.Render("NETWORK PULSE") + "\n" + labelText.Render(labels.String()) + "\n" + valueText.Render(values.String())
+	return panelStyle.Width(width).Render(body)
+}
+
+func renderRecentTransactions(transactions []mempool.Transaction, usdPrice float64, width, txPulse int, newTXIDs map[string]struct{}) string {
+	var out strings.Builder
+	out.WriteString(headerText.Render("LATEST TRANSACTIONS"))
+	out.WriteString("  ")
+	out.WriteString(labelText.Render("live mempool arrivals"))
+	out.WriteString("\n")
+
+	visible := min(10, len(transactions))
+	if visible == 0 {
+		out.WriteString("\n")
+		out.WriteString(labelText.Render("Waiting for transactions…"))
+		return panelStyle.Width(width).Render(out.String())
+	}
+
+	if width >= 64 {
+		innerWidth := width - 4
+		available := innerWidth - 3
+		txWidth := available * 30 / 100
+		usdWidth := available * 20 / 100
+		btcWidth := available * 24 / 100
+		feeWidth := available - txWidth - usdWidth - btcWidth
+		header := fmt.Sprintf("%-*s %*s %*s %*s", txWidth, "TXID", usdWidth, "USD", btcWidth, "BTC", feeWidth, "FEE")
+		out.WriteString("\n" + labelText.Render(header))
+		for _, tx := range transactions[:visible] {
+			btc := float64(tx.Value) / 100_000_000
+			feeRate := 0.0
+			if tx.VSize > 0 {
+				feeRate = float64(tx.Fee) / float64(tx.VSize)
+			}
+			row := fmt.Sprintf("%-*s %*s %*s %*s", txWidth, shortenTXIDTo(tx.TxID, txWidth), usdWidth, formatUSD(btc*usdPrice), btcWidth, fmt.Sprintf("%.8f", btc), feeWidth, fmt.Sprintf("%d (%.1f/vB)", tx.Fee, feeRate))
+			out.WriteString("\n" + styleTransactionRow(row, tx.TxID, txPulse, newTXIDs, innerWidth))
+		}
+	} else {
+		for _, tx := range transactions[:visible] {
+			btc := float64(tx.Value) / 100_000_000
+			fmt.Fprintf(&out, "\n%s  %s  %.8f BTC\n%s", valueText.Render(shortenTXID(tx.TxID)), formatUSD(btc*usdPrice), btc, labelText.Render(fmt.Sprintf("fee %d sats", tx.Fee)))
+		}
+	}
+	return panelStyle.Width(width).Render(out.String())
+}
+
+func styleTransactionRow(row, txid string, pulse int, newTXIDs map[string]struct{}, width int) string {
+	if pulse <= 0 {
+		return row
+	}
+	if _, isNew := newTXIDs[txid]; !isNew {
+		return row
+	}
+	colors := []string{"#8a6b45", "#a87331", "#c77d25", "#e58a1d", "#f7931a"}
+	index := min(pulse-1, len(colors)-1)
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(colors[index])).Width(width).Render(row)
+}
+
+func shortenTXID(txid string) string {
+	return shortenTXIDTo(txid, 13)
+}
+
+func shortenTXIDTo(txid string, width int) string {
+	if len(txid) <= width {
+		return txid
+	}
+	if width < 5 {
+		return txid[:width]
+	}
+	left := (width - 1) / 2
+	right := width - left - 1
+	return txid[:left] + "…" + txid[len(txid)-right:]
+}
+
+func formatUSD(value float64) string {
+	if value >= 1_000_000 {
+		return fmt.Sprintf("$%.2fM", value/1_000_000)
+	}
+	centsTotal := int64(math.Round(value * 100))
+	return fmt.Sprintf("$%s.%02d", formatInt(centsTotal/100), centsTotal%100)
 }
 
 func renderActivityChart(samples []activitySample, width, height int) string {
-	plotWidth := max(20, width-7)
+	const maxValue = 7000.0
+	plotColumns := max(20, width-7)
 	end := time.Now().UTC()
-	start := end.Add(-2 * time.Hour)
-	points := make(map[int]float64)
+	start := end.Add(-2 * time.Minute)
+	values := make([]float64, plotColumns)
+	for i := range values {
+		values[i] = -1
+	}
 	for _, sample := range samples {
 		if sample.at.Before(start) {
 			continue
 		}
-		x := int(sample.at.Sub(start).Seconds() / end.Sub(start).Seconds() * float64(plotWidth-1))
-		if sample.value > points[x] {
-			points[x] = sample.value
+		x := int(sample.at.Sub(start).Seconds() / end.Sub(start).Seconds() * float64(plotColumns-1))
+		x = min(max(0, x), plotColumns-1)
+		if sample.value > values[x] {
+			values[x] = sample.value
 		}
 	}
+	fillActivityGaps(values)
 
 	rows := make([]string, height)
+	brailleFill := []string{" ", "⡀", "⡄", "⡆", "⡇"}
+	logicalHeight := height * 4
 	for row := range height {
-		axisValue := 4000 - row*1000
+		axisValue := maxValue * float64(height-1-row) / float64(max(1, height-1))
 		var line strings.Builder
-		fmt.Fprintf(&line, "%4d │", axisValue)
-		for x := range plotWidth {
-			value, exists := points[x]
-			pointRow := height - 1 - int(math.Min(4000, value)/1000)
-			if exists && pointRow == row {
-				line.WriteString(activityColor(value).Render("•"))
+		if row == 0 || row == height-1 || row == height/2 {
+			fmt.Fprintf(&line, "%4.0f │", axisValue)
+		} else {
+			line.WriteString("     │")
+		}
+		for x := range plotColumns {
+			value := values[x]
+			barDots := int(math.Ceil(math.Max(0, value) / maxValue * float64(logicalHeight)))
+			dotsBelow := (height - 1 - row) * 4
+			cellDots := min(4, max(0, barDots-dotsBelow))
+			if value >= 0 && cellDots > 0 {
+				level := maxValue * float64(dotsBelow+cellDots) / float64(logicalHeight)
+				line.WriteString(activityColor(level).Render(brailleFill[cellDots]))
 			} else {
-				line.WriteString(labelText.Render("·"))
+				line.WriteString(" ")
 			}
 		}
 		rows[row] = line.String()
 	}
-	rows = append(rows, "     └"+strings.Repeat("─", plotWidth))
-	rows = append(rows, renderTimeAxis(start, end, plotWidth))
+	rows = append(rows, "     └"+strings.Repeat("─", plotColumns))
+	rows = append(rows, renderTimeAxis(start, end, plotColumns))
 	return strings.Join(rows, "\n")
+}
+
+func fillActivityGaps(values []float64) {
+	previous := -1
+	for x, value := range values {
+		if value < 0 {
+			continue
+		}
+		if previous >= 0 && x-previous > 1 {
+			left, right := values[previous], value
+			for gap := previous + 1; gap < x; gap++ {
+				ratio := float64(gap-previous) / float64(x-previous)
+				values[gap] = left + (right-left)*ratio
+			}
+		}
+		previous = x
+	}
+	if previous >= 0 {
+		for x := previous + 1; x < len(values); x++ {
+			values[x] = values[previous]
+		}
+	}
 }
 
 func activityColor(value float64) lipgloss.Style {
@@ -480,9 +771,9 @@ func renderTimeAxis(start, end time.Time, width int) string {
 	for i := range line {
 		line[i] = ' '
 	}
-	for tick := start.Truncate(15 * time.Minute).Add(15 * time.Minute); !tick.After(end); tick = tick.Add(15 * time.Minute) {
+	for tick := start.Truncate(15 * time.Second).Add(15 * time.Second); !tick.After(end); tick = tick.Add(15 * time.Second) {
 		x := 6 + int(tick.Sub(start).Seconds()/end.Sub(start).Seconds()*float64(width-1))
-		label := tick.Format("15:04")
+		label := tick.Format(":05")
 		for i, char := range label {
 			if x+i < len(line) {
 				line[x+i] = char

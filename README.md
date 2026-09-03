@@ -16,6 +16,12 @@ The overview refreshes from `https://mempool.space/api` every 15 seconds. To
 use a self-hosted mempool instance instead, set `OMPOOL_API_URL` to its API
 base URL.
 
+For automatic rebuilds while developing, run:
+
+```bash
+./scripts/dev overview
+```
+
 ## Status
 
 Early development.

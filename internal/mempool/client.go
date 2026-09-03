@@ -38,6 +38,12 @@ type Block struct {
 	TxCount   int    `json:"tx_count"`
 	Size      int64  `json:"size"`
 	Weight    int64  `json:"weight"`
+	Extras    struct {
+		Pool struct {
+			Name string `json:"name"`
+			Slug string `json:"slug"`
+		} `json:"pool"`
+	} `json:"extras"`
 }
 
 type ProjectedBlock struct {
@@ -58,12 +64,25 @@ type DifficultyAdjustment struct {
 	NextRetargetHeight    int64   `json:"nextRetargetHeight"`
 }
 
+type Transaction struct {
+	TxID  string  `json:"txid"`
+	Fee   int64   `json:"fee"`
+	VSize float64 `json:"vsize"`
+	Value int64   `json:"value"`
+}
+
+type Prices struct {
+	USD float64 `json:"USD"`
+}
+
 type Overview struct {
 	Fees            Fees
 	Mempool         Mempool
 	Blocks          []Block
 	ProjectedBlocks []ProjectedBlock
 	Difficulty      DifficultyAdjustment
+	Recent          []Transaction
+	Prices          Prices
 	Fetched         time.Time
 }
 
@@ -86,19 +105,21 @@ func (c *Client) FetchOverview(ctx context.Context) (Overview, error) {
 	}
 
 	var snapshot Overview
-	results := make(chan result, 5)
+	results := make(chan result, 7)
 
 	go func() { results <- result{"fees", c.getJSON(ctx, "/v1/fees/recommended", &snapshot.Fees)} }()
 	go func() { results <- result{"mempool", c.getJSON(ctx, "/mempool", &snapshot.Mempool)} }()
-	go func() { results <- result{"blocks", c.getJSON(ctx, "/blocks", &snapshot.Blocks)} }()
+	go func() { results <- result{"blocks", c.getJSON(ctx, "/v1/blocks", &snapshot.Blocks)} }()
 	go func() {
 		results <- result{"projected blocks", c.getJSON(ctx, "/v1/fees/mempool-blocks", &snapshot.ProjectedBlocks)}
 	}()
 	go func() {
 		results <- result{"difficulty", c.getJSON(ctx, "/v1/difficulty-adjustment", &snapshot.Difficulty)}
 	}()
+	go func() { results <- result{"recent transactions", c.getJSON(ctx, "/mempool/recent", &snapshot.Recent)} }()
+	go func() { results <- result{"prices", c.getJSON(ctx, "/v1/prices", &snapshot.Prices)} }()
 
-	for range 5 {
+	for range 7 {
 		item := <-results
 		if item.err != nil {
 			return Overview{}, fmt.Errorf("fetch %s: %w", item.name, item.err)
