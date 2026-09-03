@@ -60,6 +60,50 @@ type model struct {
 	err         error
 	width       int
 	height      int
+	renderCache *overviewRenderCache
+}
+
+type renderFragment struct {
+	content string
+	valid   bool
+}
+
+type overviewRenderCache struct {
+	header       renderFragment
+	metrics      renderFragment
+	blocks       renderFragment
+	activity     renderFragment
+	difficulty   renderFragment
+	transactions renderFragment
+	fees         renderFragment
+	network      renderFragment
+}
+
+func (c *overviewRenderCache) invalidateAll() {
+	*c = overviewRenderCache{}
+}
+
+func (c *overviewRenderCache) invalidateOverview() {
+	c.header.valid = false
+	c.metrics.valid = false
+	c.blocks.valid = false
+	c.difficulty.valid = false
+	c.transactions.valid = false
+	c.fees.valid = false
+	c.network.valid = false
+}
+
+func (c *overviewRenderCache) invalidateActivity() {
+	c.activity.valid = false
+	c.network.valid = false
+}
+
+func cached(fragment *renderFragment, render func() string) string {
+	if !fragment.valid {
+		fragment.content = render()
+		fragment.valid = true
+	}
+	return fragment.content
 }
 
 type activitySample struct {
@@ -69,8 +113,9 @@ type activitySample struct {
 
 func newModel(command string) model {
 	m := model{
-		active: modules[0],
-		client: mempool.NewClient(os.Getenv("OMPOOL_API_URL")),
+		active:      modules[0],
+		client:      mempool.NewClient(os.Getenv("OMPOOL_API_URL")),
+		renderCache: &overviewRenderCache{},
 	}
 	if command == "" {
 		return m
@@ -136,6 +181,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.renderCache.invalidateAll()
 		return m, nil
 	case overviewMsg:
 		m.loading = false
@@ -143,11 +189,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err == nil {
 			m.overview = msg.snapshot
 		}
+		m.renderCache.invalidateOverview()
 		return m, scheduleRefresh()
 	case liveStatsMsg:
 		now := time.Now()
 		if msg.HasFlow {
 			m.activity = append(m.activity, activitySample{at: now, value: msg.VBytesPerSecond})
+			m.renderCache.invalidateActivity()
 		}
 		if len(msg.Transactions) > 0 {
 			m.pendingTX = enqueueTransactions(m.pendingTX, msg.Transactions, m.overview.Recent, 40)
@@ -170,6 +218,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case txPulseMsg:
 		if m.txPulse > 0 {
 			m.txPulse--
+			m.renderCache.transactions.valid = false
 		}
 		if m.txPulse == 0 {
 			m.newTXIDs = nil
@@ -184,6 +233,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case refreshMsg:
 		if m.screen == moduleScreen && m.active.command == "overview" {
 			m.loading = true
+			m.renderCache.header.valid = false
 			return m, fetchOverview(m.client)
 		}
 		return m, nil
@@ -192,8 +242,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch msg.Button {
 			case tea.MouseWheelDown:
 				m.blockScroll = min(m.maxBlockScroll(), m.blockScroll+3)
+				m.renderCache.blocks.valid = false
 			case tea.MouseWheelUp:
 				m.blockScroll = max(0, m.blockScroll-3)
+				m.renderCache.blocks.valid = false
 			}
 		}
 		return m, nil
@@ -218,6 +270,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.screen = pickerScreen
 			m.err = nil
+			m.renderCache.invalidateAll()
 			return m, nil
 		}
 		return m, tea.Quit
@@ -228,10 +281,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			switch key.String() {
 			case "down", "j":
 				m.blockScroll = min(m.maxBlockScroll(), m.blockScroll+3)
+				m.renderCache.blocks.valid = false
 			case "up", "k":
 				m.blockScroll = max(0, m.blockScroll-3)
+				m.renderCache.blocks.valid = false
 			case "home", "g":
 				m.blockScroll = 0
+				m.renderCache.blocks.valid = false
 			}
 		}
 		return m, nil
@@ -251,6 +307,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.screen = moduleScreen
 		if m.active.command == "overview" {
 			m.loading = true
+			m.renderCache.invalidateAll()
 			ctx, cancel := context.WithCancel(context.Background())
 			m.live = m.client.StreamStats(ctx)
 			m.liveStop = cancel
@@ -321,6 +378,7 @@ func (m *model) activateNextTransaction() {
 	m.overview.Recent = mergeRecentTransactions([]mempool.Transaction{tx}, m.overview.Recent, 10)
 	m.newTXIDs = map[string]struct{}{tx.TxID: {}}
 	m.txPulse = 5
+	m.renderCache.transactions.valid = false
 }
 
 func scheduleTXPulse() tea.Cmd {
@@ -337,7 +395,7 @@ func (m model) View() tea.View {
 	var view tea.View
 	if m.screen == moduleScreen {
 		if m.active.command == "overview" {
-			view = tea.NewView(renderOverview(m.overview, m.activity, m.loading, m.err, m.width, m.height, m.blockScroll, m.txPulse, m.newTXIDs))
+			view = tea.NewView(renderOverviewCached(m.renderCache, m.overview, m.activity, m.loading, m.err, m.width, m.height, m.blockScroll, m.txPulse, m.newTXIDs))
 		} else {
 			view = tea.NewView(renderModule(m.active))
 		}
@@ -382,6 +440,10 @@ var (
 )
 
 func renderOverview(snapshot mempool.Overview, activity []activitySample, loading bool, err error, width, height, blockScroll, txPulse int, newTXIDs map[string]struct{}) string {
+	return renderOverviewCached(&overviewRenderCache{}, snapshot, activity, loading, err, width, height, blockScroll, txPulse, newTXIDs)
+}
+
+func renderOverviewCached(cache *overviewRenderCache, snapshot mempool.Overview, activity []activitySample, loading bool, err error, width, height, blockScroll, txPulse int, newTXIDs map[string]struct{}) string {
 	if width < 72 {
 		width = 72
 	}
@@ -390,7 +452,7 @@ func renderOverview(snapshot mempool.Overview, activity []activitySample, loadin
 	}
 	contentWidth := width - 4
 
-	header := renderStatusHeader(snapshot, loading, contentWidth)
+	header := cached(&cache.header, func() string { return renderStatusHeader(snapshot, loading, contentWidth) })
 	if snapshot.Fetched.IsZero() {
 		message := "Connecting to mempool.space…"
 		if err != nil {
@@ -409,9 +471,9 @@ func renderOverview(snapshot mempool.Overview, activity []activitySample, loadin
 		{"NEXT BLOCK FEE", fmt.Sprintf("%d sat/vB", snapshot.Fees.Fastest)},
 	}
 
-	metricRow := renderMetricRow(metrics, contentWidth)
+	metricRow := cached(&cache.metrics, func() string { return renderMetricRow(metrics, contentWidth) })
 
-	mainGrid := renderMainGrid(snapshot.ProjectedBlocks, snapshot.Blocks, activity, snapshot.Difficulty, snapshot.Recent, snapshot.Prices, snapshot.Fees, contentWidth, max(18, height-15), blockScroll, txPulse, newTXIDs)
+	mainGrid := renderMainGridCached(cache, snapshot.ProjectedBlocks, snapshot.Blocks, activity, snapshot.Difficulty, snapshot.Recent, snapshot.Prices, snapshot.Fees, contentWidth, max(18, height-15), blockScroll, txPulse, newTXIDs)
 
 	footer := labelText.Render("Esc modules  ·  q quit  ·  data: mempool.space")
 
@@ -506,16 +568,38 @@ func renderBlockStack(projected []mempool.ProjectedBlock, confirmed []mempool.Bl
 	return panelStyle.Width(width).Height(height - 2).Render(content)
 }
 
-func renderMainGrid(projected []mempool.ProjectedBlock, confirmed []mempool.Block, activity []activitySample, difficulty mempool.DifficultyAdjustment, recent []mempool.Transaction, prices mempool.Prices, fees mempool.Fees, width, height, scroll, txPulse int, newTXIDs map[string]struct{}) string {
+func renderMainGridCached(cache *overviewRenderCache, projected []mempool.ProjectedBlock, confirmed []mempool.Block, activity []activitySample, difficulty mempool.DifficultyAdjustment, recent []mempool.Transaction, prices mempool.Prices, fees mempool.Fees, width, height, scroll, txPulse int, newTXIDs map[string]struct{}) string {
 	gap := 2
 	leftWidth := min(34, max(28, width/3))
 	rightWidth := width - gap - leftWidth
-	left := renderBlockStack(projected, confirmed, leftWidth, height, scroll)
-	right := renderActivityAndDifficulty(activity, difficulty, recent, prices, fees, confirmed, rightWidth, height, txPulse, newTXIDs)
+	left := cached(&cache.blocks, func() string {
+		return renderBlockStack(projected, confirmed, leftWidth, height, scroll)
+	})
+	right := renderActivityAndDifficultyCached(cache, activity, difficulty, recent, prices, fees, confirmed, rightWidth, txPulse, newTXIDs)
 	return lipgloss.JoinHorizontal(lipgloss.Top, left, strings.Repeat(" ", gap), right)
 }
 
-func renderActivityAndDifficulty(activity []activitySample, difficulty mempool.DifficultyAdjustment, recent []mempool.Transaction, prices mempool.Prices, fees mempool.Fees, blocks []mempool.Block, width, height, txPulse int, newTXIDs map[string]struct{}) string {
+func renderActivityAndDifficultyCached(cache *overviewRenderCache, activity []activitySample, difficulty mempool.DifficultyAdjustment, recent []mempool.Transaction, prices mempool.Prices, fees mempool.Fees, blocks []mempool.Block, width, txPulse int, newTXIDs map[string]struct{}) string {
+	activityPanel := cached(&cache.activity, func() string {
+		return renderActivityPanel(activity, width)
+	})
+	difficultyPanel := cached(&cache.difficulty, func() string {
+		return renderDifficultyPanel(difficulty, width)
+	})
+	transactionsPanel := cached(&cache.transactions, func() string {
+		return renderRecentTransactions(recent, prices.USD, width, txPulse, newTXIDs)
+	})
+	feePanel := cached(&cache.fees, func() string {
+		return renderFeeMarket(fees, width)
+	})
+	networkPanel := cached(&cache.network, func() string {
+		return renderNetworkPulse(blocks, activity, width)
+	})
+
+	return lipgloss.JoinVertical(lipgloss.Left, activityPanel, difficultyPanel, transactionsPanel, feePanel, networkPanel)
+}
+
+func renderDifficultyPanel(difficulty mempool.DifficultyAdjustment, width int) string {
 	barWidth := max(10, width-6)
 	filled := int(math.Round(math.Max(0, math.Min(100, difficulty.ProgressPercent)) / 100 * float64(barWidth)))
 	bar := valueText.Render(strings.Repeat("█", filled)) + labelText.Render(strings.Repeat("░", barWidth-filled))
@@ -523,11 +607,10 @@ func renderActivityAndDifficulty(activity []activitySample, difficulty mempool.D
 	difficultyBody := headerText.Render("DIFFICULTY ADJUSTMENT") + "\n" + bar + "\n" +
 		valueText.Render(fmt.Sprintf("%.1f%%", difficulty.ProgressPercent)) + labelText.Render(" through epoch") + "\n" +
 		labelText.Render(fmt.Sprintf("estimate %s  ·  %s blocks left", change, formatInt(int64(difficulty.RemainingBlocks))))
-	difficultyPanel := panelStyle.Width(width).Render(difficultyBody)
-	transactionsPanel := renderRecentTransactions(recent, prices.USD, width, txPulse, newTXIDs)
-	feePanel := renderFeeMarket(fees, width)
-	networkPanel := renderNetworkPulse(blocks, activity, width)
+	return panelStyle.Width(width).Render(difficultyBody)
+}
 
+func renderActivityPanel(activity []activitySample, width int) string {
 	chartWidth := max(12, width-4)
 	chart := renderActivityChart(activity, chartWidth, 5)
 	latest := 0.0
@@ -535,9 +618,7 @@ func renderActivityAndDifficulty(activity []activitySample, difficulty mempool.D
 		latest = activity[len(activity)-1].value
 	}
 	activityBody := headerText.Render("INCOMING TRANSACTION FLOW") + "  " + valueText.Render(fmt.Sprintf("%.0f vB/s", latest)) + "  " + labelText.Render("2 min / 15 sec") + "\n\n" + chart
-	activityPanel := panelStyle.Width(width).Render(activityBody)
-
-	return lipgloss.JoinVertical(lipgloss.Left, activityPanel, difficultyPanel, transactionsPanel, feePanel, networkPanel)
+	return panelStyle.Width(width).Render(activityBody)
 }
 
 func renderFeeMarket(fees mempool.Fees, width int) string {

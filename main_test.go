@@ -88,6 +88,50 @@ func TestMetricRowUsesFullWidth(t *testing.T) {
 	}
 }
 
+func TestRenderFragmentCachesUntilInvalidated(t *testing.T) {
+	var fragment renderFragment
+	renders := 0
+	render := func() string {
+		renders++
+		return "panel"
+	}
+
+	if got := cached(&fragment, render); got != "panel" {
+		t.Fatalf("unexpected cached content %q", got)
+	}
+	cached(&fragment, render)
+	if renders != 1 {
+		t.Fatalf("render count = %d, want 1", renders)
+	}
+
+	fragment.valid = false
+	cached(&fragment, render)
+	if renders != 2 {
+		t.Fatalf("render count after invalidation = %d, want 2", renders)
+	}
+}
+
+func TestActivityInvalidationOnlyTouchesDependentPanels(t *testing.T) {
+	cache := overviewRenderCache{
+		header:       renderFragment{valid: true},
+		metrics:      renderFragment{valid: true},
+		blocks:       renderFragment{valid: true},
+		activity:     renderFragment{valid: true},
+		difficulty:   renderFragment{valid: true},
+		transactions: renderFragment{valid: true},
+		fees:         renderFragment{valid: true},
+		network:      renderFragment{valid: true},
+	}
+
+	cache.invalidateActivity()
+	if cache.activity.valid || cache.network.valid {
+		t.Fatal("activity-dependent panels should be invalidated")
+	}
+	if !cache.header.valid || !cache.metrics.valid || !cache.blocks.valid || !cache.difficulty.valid || !cache.transactions.valid || !cache.fees.valid {
+		t.Fatal("activity update invalidated an unrelated panel")
+	}
+}
+
 func TestMergeRecentTransactionsPrefersLiveArrivals(t *testing.T) {
 	incoming := []mempool.Transaction{{TxID: "new"}, {TxID: "shared", Fee: 2}}
 	existing := []mempool.Transaction{{TxID: "shared", Fee: 1}, {TxID: "old"}}
