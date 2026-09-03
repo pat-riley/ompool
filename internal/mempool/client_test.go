@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -64,5 +65,28 @@ func TestFetchOverviewRejectsBadStatus(t *testing.T) {
 
 	if _, err := client.FetchOverview(context.Background()); err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+func TestCoalesceLiveStats(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	in := make(chan LiveStats, 3)
+	out := make(chan LiveStats)
+	go coalesceLiveStats(ctx, in, out, time.Hour)
+
+	in <- LiveStats{VBytesPerSecond: 100, HasFlow: true, Transactions: []Transaction{{TxID: "one"}}}
+	in <- LiveStats{VBytesPerSecond: 200, HasFlow: true, Transactions: []Transaction{{TxID: "two"}}}
+	close(in)
+
+	got := <-out
+	if !got.HasFlow || got.VBytesPerSecond != 200 {
+		t.Fatalf("expected latest flow measurement, got %+v", got)
+	}
+	if len(got.Transactions) != 2 || got.Transactions[0].TxID != "one" || got.Transactions[1].TxID != "two" {
+		t.Fatalf("expected all transactions in order, got %+v", got.Transactions)
+	}
+	if _, ok := <-out; ok {
+		t.Fatal("expected output to close after the final batch")
 	}
 }

@@ -16,12 +16,15 @@ type LiveStats struct {
 	Transactions    []Transaction `json:"transactions"`
 }
 
+const liveUpdateInterval = 100 * time.Millisecond
+
 func (c *Client) StreamStats(ctx context.Context) <-chan LiveStats {
+	raw := make(chan LiveStats)
 	out := make(chan LiveStats)
 	go func() {
-		defer close(out)
+		defer close(raw)
 		for ctx.Err() == nil {
-			if err := c.streamOnce(ctx, out); err != nil {
+			if err := c.streamOnce(ctx, raw); err != nil {
 				select {
 				case <-ctx.Done():
 					return
@@ -30,7 +33,52 @@ func (c *Client) StreamStats(ctx context.Context) <-chan LiveStats {
 			}
 		}
 	}()
+	go coalesceLiveStats(ctx, raw, out, liveUpdateInterval)
 	return out
+}
+
+// coalesceLiveStats prevents bursts from the websocket from forcing a full UI
+// render for every transaction while retaining the newest flow measurement and
+// every transaction received during the interval.
+func coalesceLiveStats(ctx context.Context, in <-chan LiveStats, out chan<- LiveStats, interval time.Duration) {
+	defer close(out)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var pending LiveStats
+	flush := func() bool {
+		if !pending.HasFlow && len(pending.Transactions) == 0 {
+			return true
+		}
+		select {
+		case out <- pending:
+			pending = LiveStats{}
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+
+	for {
+		select {
+		case stats, ok := <-in:
+			if !ok {
+				flush()
+				return
+			}
+			if stats.HasFlow {
+				pending.VBytesPerSecond = stats.VBytesPerSecond
+				pending.HasFlow = true
+			}
+			pending.Transactions = append(pending.Transactions, stats.Transactions...)
+		case <-ticker.C:
+			if !flush() {
+				return
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
 }
 
 func (c *Client) streamOnce(ctx context.Context, out chan<- LiveStats) error {

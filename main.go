@@ -283,6 +283,12 @@ func mergeRecentTransactions(incoming, existing []mempool.Transaction, limit int
 }
 
 func enqueueTransactions(queue, incoming, existing []mempool.Transaction, limit int) []mempool.Transaction {
+	if limit <= 0 {
+		return nil
+	}
+	if len(queue) > limit {
+		queue = queue[:limit]
+	}
 	seen := make(map[string]struct{}, len(queue)+len(existing))
 	for _, tx := range queue {
 		seen[tx.TxID] = struct{}{}
@@ -291,6 +297,9 @@ func enqueueTransactions(queue, incoming, existing []mempool.Transaction, limit 
 		seen[tx.TxID] = struct{}{}
 	}
 	for _, tx := range incoming {
+		if len(queue) >= limit {
+			break
+		}
 		if tx.TxID == "" {
 			continue
 		}
@@ -299,9 +308,6 @@ func enqueueTransactions(queue, incoming, existing []mempool.Transaction, limit 
 		}
 		seen[tx.TxID] = struct{}{}
 		queue = append(queue, tx)
-		if len(queue) == limit {
-			break
-		}
 	}
 	return queue
 }

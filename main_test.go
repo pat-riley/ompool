@@ -111,6 +111,16 @@ func TestTransactionsAnimateOneAtATime(t *testing.T) {
 	}
 }
 
+func TestEnqueueTransactionsNeverExceedsLimit(t *testing.T) {
+	queue := []mempool.Transaction{{TxID: "one"}, {TxID: "two"}, {TxID: "three"}}
+	incoming := []mempool.Transaction{{TxID: "four"}, {TxID: "five"}}
+
+	got := enqueueTransactions(queue, incoming, nil, 2)
+	if len(got) != 2 || got[0].TxID != "one" || got[1].TxID != "two" {
+		t.Fatalf("queue exceeded limit or changed order: %+v", got)
+	}
+}
+
 func TestFillActivityGaps(t *testing.T) {
 	values := []float64{-1, 100, -1, -1, 400, -1}
 	fillActivityGaps(values)
