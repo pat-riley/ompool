@@ -113,6 +113,30 @@ func TestFetchBlockHistoryKeepsConcurrentPagesInChainOrder(t *testing.T) {
 	}
 }
 
+func TestFetchTransactionLoadsDetailHexAndOutspends(t *testing.T) {
+	client := NewClient("https://example.test/api")
+	client.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/api/tx/abc":
+			return response(http.StatusOK, `{"txid":"abc","fee":120,"weight":400,"vin":[{"txid":"parent","vout":1,"prevout":{"value":5000}}],"vout":[{"value":4880,"scriptpubkey_type":"p2wpkh"}],"status":{"confirmed":true,"block_height":10}}`), nil
+		case "/api/tx/abc/hex":
+			return response(http.StatusOK, "010203\n"), nil
+		case "/api/tx/abc/outspends":
+			return response(http.StatusOK, `[{"spent":true,"txid":"child","vin":0}]`), nil
+		default:
+			return response(http.StatusNotFound, "not found"), nil
+		}
+	})
+
+	inspection, err := client.FetchTransaction(context.Background(), "abc")
+	if err != nil {
+		t.Fatalf("FetchTransaction() error = %v", err)
+	}
+	if inspection.Transaction.TxID != "abc" || inspection.RawHex != "010203" || len(inspection.Outspends) != 1 || !inspection.Outspends[0].Spent {
+		t.Fatalf("unexpected transaction inspection: %+v", inspection)
+	}
+}
+
 func TestCoalesceLiveStats(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

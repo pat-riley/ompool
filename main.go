@@ -26,6 +26,7 @@ var modules = []module{
 	{command: "blockchain", title: "Blockchain", description: "An ASCII visualization of the chain", hidden: true},
 	{command: "blocks", title: "Recent Blocks", description: "A live feed of newly mined blocks"},
 	{command: "transactions", title: "Transactions", description: "Live transactions entering the mempool"},
+	{command: "viewer", title: "Transaction Viewer", description: "Inspect a transaction, its UTXOs, hex, and embedded data"},
 	{command: "mempool", title: "Mempool", description: "Transaction backlog, weight, and activity"},
 	{command: "fees", title: "Fees", description: "Current fee estimates and recent trends", hidden: true},
 	{command: "difficulty", title: "Difficulty", description: "Retarget progress and mining cadence", hidden: true},
@@ -80,6 +81,12 @@ type model struct {
 	width       int
 	height      int
 	renderCache *overviewRenderCache
+	viewer      transactionViewerState
+
+	// frame drives the title and loading screen animations; animGen lets a
+	// restarted tick chain retire any older one still in flight.
+	frame   int
+	animGen int
 }
 
 type renderFragment struct {
@@ -154,8 +161,10 @@ func newModel(command string) model {
 		if candidate.command == command {
 			m.screen = moduleScreen
 			m.active = candidate
-			m.loading = true
-			m.startLiveStream()
+			if candidate.command != "viewer" {
+				m.loading = true
+				m.startLiveStream()
+			}
 			return m
 		}
 	}
@@ -175,10 +184,26 @@ type txPulseMsg struct{}
 type blockPulseMsg struct{}
 
 func (m model) Init() tea.Cmd {
-	if m.screen == moduleScreen {
-		return moduleDataCommands(m.client, m.live, m.active.command)
+	var cmds []tea.Cmd
+	if m.screen == moduleScreen && m.active.command != "viewer" {
+		cmds = append(cmds, moduleDataCommands(m.client, m.live, m.active.command))
 	}
-	return nil
+	if m.wantsAnimation() {
+		cmds = append(cmds, scheduleTitleTick(m.animGen))
+	}
+	return tea.Batch(cmds...)
+}
+
+// wantsAnimation reports whether the current view is one of the animated
+// screens: the launcher, or a module still waiting for its first snapshot.
+func (m model) wantsAnimation() bool {
+	return m.screen == pickerScreen || (m.active.command != "viewer" && m.overview.Fetched.IsZero())
+}
+
+// restartAnimation begins a fresh tick chain and retires any older one.
+func (m *model) restartAnimation() tea.Cmd {
+	m.animGen++
+	return scheduleTitleTick(m.animGen)
 }
 
 func (m *model) startLiveStream() {
@@ -306,6 +331,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(scheduleRefresh(), scheduleBlockPulse(), tea.Raw("\a"))
 		}
 		return m, scheduleRefresh()
+	case transactionInspectionMsg:
+		if msg.requestID != m.viewer.requestID {
+			return m, nil
+		}
+		m.viewer.loading = false
+		m.viewer.err = msg.err
+		if msg.err == nil {
+			m.viewer.inspection = &msg.inspection
+		}
+		return m, nil
+	case tea.PasteMsg:
+		if m.screen == moduleScreen && m.active.command == "viewer" {
+			if m.viewer.inspection != nil && m.viewer.query == m.viewer.loaded {
+				m.viewer.query = ""
+			}
+			m.viewer.query = appendViewerInput(m.viewer.query, msg.Content)
+			m.viewer.err = nil
+		}
+		return m, nil
 	case liveStatsMsg:
 		now := time.Now()
 		if msg.HasFlow {
@@ -368,14 +412,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, scheduleBlockPulse()
 	case liveStreamClosedMsg:
 		return m, nil
+	case titleTickMsg:
+		if msg.gen != m.animGen || !m.wantsAnimation() {
+			return m, nil
+		}
+		m.frame++
+		return m, scheduleTitleTick(m.animGen)
 	case refreshMsg:
-		if m.screen == moduleScreen {
+		if m.screen == moduleScreen && m.active.command != "viewer" {
 			m.loading = true
 			m.renderCache.header.valid = false
 			return m, fetchOverview(m.client, m.active.command)
 		}
 		return m, nil
 	case tea.MouseWheelMsg:
+		if m.screen == moduleScreen && m.active.command == "viewer" {
+			width, height := m.terminalSize()
+			l := newLayout(width, height)
+			if viewerUsesThreeColumns(l) {
+				inputWidth, outputWidth, _ := viewerColumnWidths(l.content, l.columnGap)
+				x := msg.X - l.padX
+				switch {
+				case x < inputWidth:
+					m.viewer.pane = 0
+				case x < inputWidth+l.columnGap+outputWidth:
+					m.viewer.pane = 1
+				default:
+					m.viewer.pane = 2
+				}
+			} else if l.twoColumn {
+				m.viewer.pane = 0
+				if msg.X >= l.padX+max(38, l.content*43/100) {
+					m.viewer.pane = 1
+				}
+			}
+			delta := 0
+			if msg.Button == tea.MouseWheelDown {
+				delta = 3
+			} else if msg.Button == tea.MouseWheelUp {
+				delta = -3
+			}
+			m.moveViewerScroll(delta)
+			return m, nil
+		}
 		if m.screen == moduleScreen && moduleScrollsBlocks(m.active.command) && m.overBlockStack(msg.X) {
 			switch msg.Button {
 			case tea.MouseWheelDown:
@@ -409,12 +488,59 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.screen = pickerScreen
 			m.err = nil
 			m.renderCache.invalidateAll()
-			return m, nil
+			return m, m.restartAnimation()
 		}
 		return m, tea.Quit
 	}
 
 	if m.screen != pickerScreen {
+		if m.active.command == "viewer" {
+			switch key.String() {
+			case "enter":
+				return m, m.inspectTransaction(m.viewer.query)
+			case "L", "shift+l":
+				return m, m.loadTransactionPreset(lenSassamanTXID)
+			case "G", "shift+g":
+				return m, m.loadTransactionPreset(genesisTXID)
+			case "tab", "right":
+				width, height := m.terminalSize()
+				paneCount := 2
+				if viewerUsesThreeColumns(newLayout(width, height)) {
+					paneCount = 3
+				}
+				m.viewer.pane = (m.viewer.pane + 1) % paneCount
+			case "left":
+				width, height := m.terminalSize()
+				paneCount := 2
+				if viewerUsesThreeColumns(newLayout(width, height)) {
+					paneCount = 3
+				}
+				m.viewer.pane = (m.viewer.pane + paneCount - 1) % paneCount
+			case "up":
+				m.moveViewerScroll(-1)
+			case "down":
+				m.moveViewerScroll(1)
+			case "pgup":
+				m.moveViewerScroll(-10)
+			case "pgdown":
+				m.moveViewerScroll(10)
+			case "ctrl+u":
+				m.viewer.query = ""
+				m.viewer.err = nil
+			case "backspace":
+				m.viewer.query = removeLastRune(m.viewer.query)
+				m.viewer.err = nil
+			default:
+				if text := key.Key().Text; text != "" {
+					if m.viewer.inspection != nil && m.viewer.query == m.viewer.loaded {
+						m.viewer.query = ""
+					}
+					m.viewer.query = appendViewerInput(m.viewer.query, text)
+					m.viewer.err = nil
+				}
+			}
+			return m, nil
+		}
 		if moduleScrollsBlocks(m.active.command) {
 			switch key.String() {
 			case "down", "j":
@@ -443,8 +569,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case "enter":
 		m.active = homeModules()[m.cursor]
 		m.screen = moduleScreen
-		m.loading = true
 		m.renderCache.invalidateAll()
+		if m.active.command == "viewer" {
+			m.loading = false
+			return m, nil
+		}
+		m.loading = true
 		m.startLiveStream()
 		return m, moduleDataCommands(m.client, m.live, m.active.command)
 	}
@@ -557,57 +687,19 @@ func (m model) terminalSize() (int, int) {
 func (m model) View() tea.View {
 	var view tea.View
 	width, height := m.terminalSize()
-	if m.screen == moduleScreen {
+	switch {
+	case m.screen != moduleScreen:
+		view = tea.NewView(renderPicker(m.cursor, m.frame, width, height))
+	case m.active.command == "viewer":
+		view = tea.NewView(renderTransactionViewer(m.viewer, width, height))
+	case m.overview.Fetched.IsZero():
+		view = tea.NewView(renderLoadingScreen(m.active, m.err, m.frame, width, height))
+	default:
 		view = tea.NewView(renderActiveModule(m.renderCache, m.active, m.overview, m.activity, m.txValues, m.loading, m.err, width, height, m.blockScroll, m.txPulse, m.newTXIDs, m.blockPulse, m.newBlockID))
-	} else {
-		view = tea.NewView(renderPicker(m.cursor, width, height))
 	}
 	view.AltScreen = true
 	view.MouseMode = tea.MouseModeCellMotion
 	return view
-}
-
-func renderPicker(cursor, width, height int) string {
-	if width < floorWidth || height < floorHeight {
-		return renderTooSmall(width, height)
-	}
-	var menu strings.Builder
-	// The wordmark is 36 columns of ASCII art; it is the first thing to go when
-	// the terminal cannot hold it without wrapping.
-	if width >= 52 && height >= 18 {
-		menu.WriteString(wordmarkText.Render(wordmark))
-	} else {
-		menu.WriteString("\n" + headerText.Render("OMPOOL // FAST CHAIN DATA") + "\n")
-	}
-	tagline := "Bitcoin from the terminal"
-	indent := max(0, min(13, (width-lipgloss.Width(tagline))/2))
-	menu.WriteString(strings.Repeat(" ", indent) + labelText.Render(tagline) + "\n\n")
-
-	// Titles are padded into a column only while the descriptions still fit
-	// beside them; below that each row is just the title.
-	const titleColumn = 16
-	showDescription := width >= titleColumn+26
-	for i, item := range homeModules() {
-		marker := "  "
-		if i == cursor {
-			marker = "> "
-		}
-		row := marker + item.title
-		if showDescription {
-			row = fmt.Sprintf("%s%-*s %s", marker, titleColumn, item.title,
-				ellipsize(item.description, width-titleColumn-3))
-		}
-		menu.WriteString(truncate(row, max(1, width-8)) + "\n")
-	}
-
-	hint := "↑/↓ navigate  enter open  q quit"
-	if width < lipgloss.Width(hint) {
-		hint = "↑/↓  enter  q"
-	}
-	menu.WriteString("\n" + truncate(hint, max(1, width-8)) + "\n")
-	boxWidth := min(width-4, max(32, min(78, width-8)))
-	box := panelStyle.Width(boxWidth).Render(menu.String())
-	return placeCentered(box, width, height)
 }
 
 func renderModule(item module, width, height int) string {
@@ -618,15 +710,17 @@ func renderModule(item module, width, height int) string {
 }
 
 var (
-	orange       = lipgloss.Color("#f7931a")
-	dim          = lipgloss.Color("#777777")
-	panelBorder  = lipgloss.Color("#343434")
-	bright       = lipgloss.Color("#f5f5f5")
-	headerText   = lipgloss.NewStyle().Bold(true).Foreground(bright)
-	labelText    = lipgloss.NewStyle().Foreground(dim)
-	valueText    = lipgloss.NewStyle().Bold(true).Foreground(orange)
-	wordmarkText = lipgloss.NewStyle().Bold(true).Italic(true).Foreground(orange)
-	panelStyle   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(panelBorder).Padding(0, 1)
+	orange        = lipgloss.Color("#f7931a")
+	green         = lipgloss.Color("#38d66b")
+	dim           = lipgloss.Color("#777777")
+	panelBorder   = lipgloss.Color("#343434")
+	bright        = lipgloss.Color("#f5f5f5")
+	headerText    = lipgloss.NewStyle().Bold(true).Foreground(bright)
+	labelText     = lipgloss.NewStyle().Foreground(dim)
+	valueText     = lipgloss.NewStyle().Bold(true).Foreground(orange)
+	confirmedText = lipgloss.NewStyle().Bold(true).Foreground(green)
+	wordmarkText  = lipgloss.NewStyle().Bold(true).Italic(true).Foreground(orange)
+	panelStyle    = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(panelBorder).Padding(0, 1)
 )
 
 // Breakpoints. Every size-dependent decision is made once, in newLayout, so the
@@ -816,7 +910,7 @@ func renderOverviewCached(cache *overviewRenderCache, snapshot mempool.Overview,
 	footer := labelText.Render(l.footer)
 
 	if snapshot.Fetched.IsZero() {
-		return renderLoadingScreen(modules[0], err, width, height)
+		return renderLoadingScreen(modules[0], err, 0, width, height)
 	}
 
 	block := snapshot.Blocks[0]
@@ -1127,26 +1221,36 @@ func appendIfItFits(base, extra string, width int) string {
 
 func blockCardLines(projected []mempool.ProjectedBlock, confirmed []mempool.Block, width, blockPulse int, newBlockID string) []string {
 	cardWidth := max(1, width-4)
-	const cardHeight = 5
+	// The card's usable width, inside its border and padding.
+	inner := max(1, cardWidth-4)
+	const cardHeight = 6
 	items := make([]string, 0, len(projected)+len(confirmed)+1)
 	for _, b := range projected {
-		body := valueText.Render(fmt.Sprintf("%.1f sat/vB", b.MedianFee)) + "\n" +
-			labelText.Render("median fee") + "\n\n" +
+		body := valueText.Render(fmt.Sprintf("~%.1f sat/vB", b.MedianFee)) + "  " + labelText.Render("median") + "\n" +
+			capacityGauge(projectedFullness(b), inner, valueText) + "\n" +
+			labelText.Render(ellipsize(projectedFeeRange(b), inner)) + "\n" +
 			headerText.Render(formatBytes(int64(b.BlockVSize), "vB")) + "  " +
 			labelText.Render(formatInt(int64(b.TxCount))+" tx")
-		items = append(items, panelStyle.Width(cardWidth).Height(cardHeight).BorderForeground(dim).Render(body))
+		items = append(items, panelStyle.Width(cardWidth).Height(cardHeight).BorderForeground(orange).Render(body))
 	}
 	items = append(items, confirmedDivider(cardWidth))
 	for _, b := range confirmed {
-		heightLine := valueText.Render("#" + formatInt(b.Height))
-		borderColor := orange
+		heightLine := confirmedText.Render("#" + formatInt(b.Height))
+		borderColor := green
+		gaugeStyle := confirmedText
 		if marker, hex, pulsing := blockPulseMarker(b.ID, blockPulse, newBlockID); pulsing {
 			borderColor = lipgloss.Color(hex)
-			heightLine += "  " + lipgloss.NewStyle().Bold(true).Foreground(borderColor).Render(marker)
+			gaugeStyle = lipgloss.NewStyle().Bold(true).Foreground(borderColor)
+			heightLine += "  " + gaugeStyle.Render(marker)
 		}
-		body := heightLine + "\n" +
-			headerText.Render(poolName(b)) + "\n" +
-			labelText.Render(age(b.Timestamp)) + "\n" +
+		// The age gives way to the new-block marker while it flashes.
+		ageLabel := labelText.Render(age(b.Timestamp))
+		if lipgloss.Width(heightLine)+1+lipgloss.Width(ageLabel) > inner {
+			ageLabel = ""
+		}
+		body := justify(heightLine, ageLabel, inner) + "\n" +
+			capacityGauge(confirmedFullness(b), inner, gaugeStyle) + "\n" +
+			headerText.Render(ellipsize(poolName(b), inner)) + "\n" +
 			headerText.Render(formatInt(int64(b.TxCount))+" tx") + "  " +
 			labelText.Render(formatBytes(b.Size, "B"))
 		items = append(items, panelStyle.Width(cardWidth).Height(cardHeight).BorderForeground(borderColor).Render(body))
@@ -1154,11 +1258,53 @@ func blockCardLines(projected []mempool.ProjectedBlock, confirmed []mempool.Bloc
 	return strings.Split(lipgloss.JoinVertical(lipgloss.Left, items...), "\n")
 }
 
+func projectedFeeRange(b mempool.ProjectedBlock) string {
+	if len(b.FeeRange) == 0 {
+		return "fee range pending"
+	}
+	return feeRange(b.FeeRange) + " sat/vB range"
+}
+
+// projectedFullness is how much of the next block's one-megabyte virtual size
+// the mempool has already filled.
+func projectedFullness(b mempool.ProjectedBlock) float64 {
+	return min(1, max(0, b.BlockVSize/1_000_000))
+}
+
+// confirmedFullness measures a mined block against the four-million weight
+// unit limit, falling back to bytes when the API omitted the weight.
+func confirmedFullness(b mempool.Block) float64 {
+	fullness := float64(b.Weight) / 4_000_000
+	if b.Weight == 0 {
+		fullness = float64(b.Size) / 1_800_000
+	}
+	return min(1, max(0, fullness))
+}
+
+// capacityGauge is a braille bar that fills bottom-up, cell by cell, followed
+// by the percentage it shows. It is the same gauge the title screen's blocks
+// carry, so a block reads the same everywhere.
+func capacityGauge(fullness float64, width int, style lipgloss.Style) string {
+	percent := fmt.Sprintf("%3.0f%%", fullness*100)
+	cells := width - len(percent) - 1
+	if cells < 4 {
+		return labelText.Render(percent)
+	}
+	units := int(math.Round(fullness * float64(cells) * 4))
+	var bar strings.Builder
+	for cell := range cells {
+		bar.WriteString(brailleCapacityCell(min(4, max(0, units-cell*4))))
+	}
+	return style.Render(bar.String()) + " " + labelText.Render(percent)
+}
+
 // blockRowLines is the single-column form of the stack: one line per block, so
 // a short terminal still shows the shape of the chain rather than two cards.
 // Columns are dropped from the right as the panel narrows.
 func blockRowLines(projected []mempool.ProjectedBlock, confirmed []mempool.Block, width, blockPulse int, newBlockID string) []string {
 	inner := max(1, width-4)
+	// A compact gauge joins the row once the panel is wide enough for it.
+	const gaugeWidth = 13
 	lines := make([]string, 0, len(projected)+len(confirmed)+1)
 	for _, b := range projected {
 		right := ""
@@ -1168,12 +1314,16 @@ func blockRowLines(projected []mempool.ProjectedBlock, confirmed []mempool.Block
 		if inner >= 34 {
 			right += "  " + labelText.Render(padLeft(formatInt(int64(b.TxCount))+" tx", 9))
 		}
-		lines = append(lines, justify(valueText.Render(fmt.Sprintf("~%.1f sat/vB", b.MedianFee)), right, inner))
+		left := valueText.Render(pad(fmt.Sprintf("~%.1f sat/vB", b.MedianFee), 13))
+		if inner >= 30+gaugeWidth {
+			left += "  " + capacityGauge(projectedFullness(b), gaugeWidth, valueText)
+		}
+		lines = append(lines, justify(left, right, inner))
 	}
 	lines = append(lines, confirmedDivider(inner))
 	for _, b := range confirmed {
 		heightCell := "#" + formatInt(b.Height)
-		style := valueText
+		style := confirmedText
 		if marker, hex, pulsing := blockPulseMarker(b.ID, blockPulse, newBlockID); pulsing {
 			style = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(hex))
 			heightCell = string([]rune(marker)[:1]) + " " + heightCell
@@ -1190,6 +1340,10 @@ func blockRowLines(projected []mempool.ProjectedBlock, confirmed []mempool.Block
 			poolWidth -= 11
 		}
 		left := style.Render(pad(heightCell, 10))
+		if poolWidth >= 12+gaugeWidth+2 {
+			left += "  " + capacityGauge(confirmedFullness(b), gaugeWidth, style)
+			poolWidth -= gaugeWidth + 2
+		}
 		if poolWidth >= 12 {
 			left += "  " + headerText.Render(ellipsize(poolName(b), poolWidth))
 		}
@@ -1221,7 +1375,8 @@ func blockPulseMarker(id string, blockPulse int, newBlockID string) (string, str
 	if blockPulse <= 0 || id == "" || id != newBlockID {
 		return "", "", false
 	}
-	pulseColors := []string{"#5a3a16", "#8a511a", "#bd6d18", "#f7931a"}
+	// The card flashes white and settles into the green of a confirmed block.
+	pulseColors := []string{"#38d66b", "#6fd88a", "#a8e6b8", "#f5f5f5"}
 	marker := "◇ NEW BLOCK"
 	if blockPulse%2 == 0 {
 		marker = "◆ NEW BLOCK"

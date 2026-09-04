@@ -13,6 +13,9 @@ import (
 )
 
 func renderActiveModule(cache *overviewRenderCache, active module, snapshot mempool.Overview, activity []activitySample, txValues []transactionValueSample, loading bool, err error, width, height, blockScroll, txPulse int, newTXIDs map[string]struct{}, blockPulse int, newBlockID string) string {
+	if active.command == "viewer" {
+		return renderTransactionViewer(transactionViewerState{}, width, height)
+	}
 	if active.command == "overview" {
 		return renderOverviewCached(cache, snapshot, activity, loading, err, width, height, blockScroll, txPulse, newTXIDs, blockPulse, newBlockID)
 	}
@@ -20,7 +23,7 @@ func renderActiveModule(cache *overviewRenderCache, active module, snapshot memp
 		return renderTooSmall(width, height)
 	}
 	if snapshot.Fetched.IsZero() {
-		return renderLoadingScreen(active, err, width, height)
+		return renderLoadingScreen(active, err, 0, width, height)
 	}
 
 	l := newLayout(width, height)
@@ -62,23 +65,6 @@ func renderModuleHeader(active module, snapshot mempool.Overview, loading bool, 
 	status += labelText.Render("  " + snapshot.Fetched.UTC().Format("15:04:05 UTC"))
 	gap := max(1, l.content-lipgloss.Width(left)-lipgloss.Width(status))
 	return truncate(left+strings.Repeat(" ", gap)+status, l.content)
-}
-
-func renderLoadingScreen(active module, err error, width, height int) string {
-	l := newLayout(width, height)
-	title := headerText.Render("OMPOOL // LIVE BITCOIN DATA")
-	if l.content >= 48 && height >= 16 {
-		title = wordmarkText.Render(wordmark)
-	}
-	message := headerText.Render("LOADING "+strings.ToUpper(active.title)) + "\n" +
-		labelText.Render("Fast path → fetching chain state in parallel")
-	if err != nil {
-		message = headerText.Render("CONNECTION DELAYED") + "\n" + labelText.Render(ellipsize(err.Error(), max(1, l.content-8)))
-	}
-	body := title + "\n" + message
-	boxWidth := min(l.content, max(34, min(72, l.content)))
-	box := panelStyle.Width(boxWidth).Render(body)
-	return placeCentered(box, width, height)
 }
 
 func placeCentered(content string, width, height int) string {

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"image/color"
 	"math"
 	"regexp"
 	"strings"
@@ -19,10 +21,10 @@ func TestPickerDefaultsToOverview(t *testing.T) {
 	if m.cursor != 0 || modules[m.cursor].command != "overview" {
 		t.Fatalf("expected overview to be selected by default")
 	}
-	if !strings.Contains(renderPicker(m.cursor, 80, 24), "> Overview") {
+	if !strings.Contains(plain(renderPicker(m.cursor, 0, 80, 24)), "▸ Overview") {
 		t.Fatalf("expected picker to mark Overview as selected")
 	}
-	if !strings.Contains(renderPicker(m.cursor, 80, 24), "____  __  ___") {
+	if !strings.Contains(renderPicker(m.cursor, 0, 80, 24), "____  __  ___") {
 		t.Fatalf("expected picker to include the ompool wordmark")
 	}
 }
@@ -40,8 +42,8 @@ func TestPickerNavigationAndSelection(t *testing.T) {
 }
 
 func TestHomepageHidesBlockchain(t *testing.T) {
-	view := renderPicker(0, 100, 32)
-	if strings.Contains(view, "> Blockchain") || strings.Contains(view, "  Blockchain") {
+	view := plain(renderPicker(0, 0, 100, 32))
+	if strings.Contains(view, "▸ Blockchain") || strings.Contains(view, "  Blockchain") {
 		t.Fatalf("homepage should not expose the blockchain module:\n%s", view)
 	}
 	if !validCommand("blockchain") {
@@ -80,6 +82,7 @@ func TestEveryDedicatedModuleRendersItsPrimaryContent(t *testing.T) {
 		"blockchain":   "BLOCKCHAIN / BLOCK ANATOMY",
 		"blocks":       "CONFIRMED BLOCKS",
 		"transactions": "LATEST TRANSACTIONS",
+		"viewer":       "TRANSACTION VIEWER",
 		"mempool":      "LIVE TRANSACTION VALUE",
 		"fees":         "BLOCK FEE LADDER",
 		"difficulty":   "MINING CADENCE",
@@ -94,6 +97,112 @@ func TestEveryDedicatedModuleRendersItsPrimaryContent(t *testing.T) {
 		}
 		if lipgloss.Width(view) != 120 || lipgloss.Height(view) != 40 {
 			t.Errorf("%s module rendered at %dx%d, want 120x40", candidate.command, lipgloss.Width(view), lipgloss.Height(view))
+		}
+	}
+}
+
+func TestTransactionViewerIsAvailableFromHomepage(t *testing.T) {
+	view := plain(renderPicker(0, 0, 120, 40))
+	if !strings.Contains(view, "Transaction Viewer") {
+		t.Fatalf("homepage should expose the transaction viewer:\n%s", view)
+	}
+	if !validCommand("viewer") {
+		t.Fatal("viewer should also be available as a direct command")
+	}
+}
+
+func TestTransactionViewerAcceptsPasteAndPresetKeys(t *testing.T) {
+	m := newModel("viewer")
+	updated, _ := m.Update(tea.PasteMsg{Content: "https://mempool.space/tx/abc123"})
+	m = updated.(model)
+	if m.viewer.query != "https://mempool.space/tx/abc123" {
+		t.Fatalf("paste was not placed in the lookup field: %q", m.viewer.query)
+	}
+	updated, cmd := m.Update(tea.KeyPressMsg{Code: 'l', Text: "L"})
+	m = updated.(model)
+	if cmd == nil || m.viewer.query != lenSassamanTXID || !m.viewer.loading {
+		t.Fatalf("Shift+L should immediately load the Len Sassaman preset: %+v", m.viewer)
+	}
+}
+
+func TestNormalizeTransactionIDAcceptsExplorerURL(t *testing.T) {
+	got, err := normalizeTransactionID("https://mempool.space/tx/" + strings.ToUpper(genesisTXID) + "?showDetails=true")
+	if err != nil || got != genesisTXID {
+		t.Fatalf("normalizeTransactionID() = %q, %v", got, err)
+	}
+	if _, err := normalizeTransactionID("not a transaction"); err == nil {
+		t.Fatal("expected invalid transaction ID to be rejected")
+	}
+}
+
+func TestEmbeddedPayloadExtractionFindsGenesisMessageAndPortraitLines(t *testing.T) {
+	genesis := mempool.TransactionInspection{Transaction: mempool.TransactionDetail{
+		Vin: []mempool.TransactionInput{{ScriptSig: "04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73"}},
+	}}
+	genesisLines := plain(strings.Join(viewerDataLines(genesis, 72), "\n"))
+	if !strings.Contains(genesisLines, "The Times 03/Jan/2009 Chancellor on brink of second bailout for banks") || !strings.Contains(genesisLines, "54686520") {
+		t.Fatalf("genesis payload should expose both ASCII and hex:\n%s", genesisLines)
+	}
+
+	portrait := mempool.TransactionInspection{Transaction: mempool.TransactionDetail{
+		Vout: []mempool.TransactionOutput{
+			{ScriptPubKey: "76a9142d2d2d424547494e20545249425554452d2d2d2088ac"},
+			{ScriptPubKey: "76a914232e2f4269744c656e202020202020202020202088ac"},
+		},
+	}}
+	portraitLines := plain(strings.Join(viewerDataLines(portrait, 72), "\n"))
+	if !strings.Contains(portraitLines, "---BEGIN TRIBUTE---") || !strings.Contains(portraitLines, "#./BitLen") {
+		t.Fatalf("portrait output pushes should be reconstructed in order:\n%s", portraitLines)
+	}
+}
+
+func TestTransactionViewerRendersRightHandDataPane(t *testing.T) {
+	inspection := mempool.TransactionInspection{Transaction: mempool.TransactionDetail{
+		TxID: genesisTXID, Size: 204, Weight: 816, Vout: []mempool.TransactionOutput{{Value: 5_000_000_000}},
+		Vin:    []mempool.TransactionInput{{IsCoinbase: true, ScriptSig: "04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73"}},
+		Status: mempool.TransactionStatus{Confirmed: true, BlockHeight: 0},
+	}}
+	view := renderTransactionViewer(transactionViewerState{inspection: &inspection, query: genesisTXID}, 140, 42)
+	for _, want := range []string{"INPUT UTXOs", "OUTPUT UTXOs", "ON-CHAIN DATA / ASCII + HEX", "The Times 03/Jan/2009", "EMBEDDED PAYLOAD HEX"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("transaction viewer should contain %q:\n%s", want, plain(view))
+		}
+	}
+	if lipgloss.Width(view) != 140 || lipgloss.Height(view) != 42 {
+		t.Fatalf("viewer rendered at %dx%d", lipgloss.Width(view), lipgloss.Height(view))
+	}
+}
+
+func TestWideTransactionViewerGivesInputsAndOutputsDedicatedColumns(t *testing.T) {
+	l := newLayout(140, 42)
+	if !viewerUsesThreeColumns(l) {
+		t.Fatal("140-column viewer should use the three-column layout")
+	}
+	inputWidth, outputWidth, dataWidth := viewerColumnWidths(l.content, l.columnGap)
+	if inputWidth+outputWidth+dataWidth+2*l.columnGap != l.content {
+		t.Fatalf("viewer columns do not fill content width: %d + %d + %d", inputWidth, outputWidth, dataWidth)
+	}
+	if inputWidth != outputWidth || outputWidth != dataWidth {
+		t.Fatalf("viewer columns should be equal: inputs=%d outputs=%d data=%d", inputWidth, outputWidth, dataWidth)
+	}
+}
+
+func TestViewerUTXOColumnsOnlyShowAddressAmountAndDirection(t *testing.T) {
+	inspection := mempool.TransactionInspection{Transaction: mempool.TransactionDetail{
+		Vin:  []mempool.TransactionInput{{Prevout: &mempool.TransactionOutput{ScriptPubKeyAddress: "input-address", Value: 125_000_000}}},
+		Vout: []mempool.TransactionOutput{{ScriptPubKeyAddress: "output-address", Value: 75_000_000}},
+	}}
+	inputs := plain(strings.Join(viewerInputLines(inspection), "\n"))
+	outputs := plain(strings.Join(viewerOutputLines(inspection), "\n"))
+	if !strings.Contains(inputs, "input-address\n  -> 1.2500 BTC") {
+		t.Fatalf("input should flow from its address toward the transaction:\n%s", inputs)
+	}
+	if !strings.Contains(outputs, "0.7500 BTC ->\n  output-address") {
+		t.Fatalf("output should flow from the transaction toward its address:\n%s", outputs)
+	}
+	for _, unwanted := range []string{"version", "locktime", "SPENT", "P2WPKH"} {
+		if strings.Contains(inputs+outputs, unwanted) {
+			t.Fatalf("UTXO columns should omit %q metadata:\n%s\n%s", unwanted, inputs, outputs)
 		}
 	}
 }
@@ -289,7 +398,7 @@ func TestMiningChartOverlaysAllThreeSeries(t *testing.T) {
 }
 
 func TestHomeScreenKeepsTheModuleListFocused(t *testing.T) {
-	view := renderPicker(0, 100, 32)
+	view := renderPicker(0, 0, 100, 32)
 	for _, want := range []string{"Overview", "Recent Blocks", "Transactions", "Mempool", "Mining"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("home screen should include %q", want)
@@ -714,14 +823,14 @@ func TestTerminalBelowTheFloorExplainsItself(t *testing.T) {
 }
 
 func TestPickerDropsChromeItCannotFit(t *testing.T) {
-	if !strings.Contains(renderPicker(0, 80, 24), "____  __  ___") {
+	if !strings.Contains(renderPicker(0, 0, 80, 24), "____  __  ___") {
 		t.Fatal("a roomy terminal should keep the wordmark")
 	}
-	small := renderPicker(0, 30, 10)
+	small := plain(renderPicker(0, 0, 30, 10))
 	if strings.Contains(small, "____  __  ___") {
 		t.Fatal("the wordmark should give way in a small terminal")
 	}
-	for _, want := range []string{"OMPOOL", "> Overview"} {
+	for _, want := range []string{"OMPOOL", "▸ Overview"} {
 		if !strings.Contains(small, want) {
 			t.Fatalf("expected the small picker to keep %q:\n%s", want, small)
 		}
@@ -793,5 +902,246 @@ func TestATallerTerminalGetsATallerFlowChart(t *testing.T) {
 	}
 	if newLayout(120, 60).chartHeight <= newLayout(120, 24).chartHeight {
 		t.Fatal("a 60 row terminal should plot more detail than a 24 row one")
+	}
+}
+
+func TestTitleScreenFillsEveryTerminalExactly(t *testing.T) {
+	for _, size := range [][2]int{{30, 10}, {60, 20}, {80, 24}, {120, 36}, {200, 50}, {250, 70}} {
+		for _, frame := range []int{0, 1, 9, 250} {
+			view := renderPicker(0, frame, size[0], size[1])
+			if lipgloss.Width(view) != size[0] || lipgloss.Height(view) != size[1] {
+				t.Fatalf("title screen at %dx%d frame %d rendered %dx%d", size[0], size[1], frame, lipgloss.Width(view), lipgloss.Height(view))
+			}
+			for i, line := range strings.Split(view, "\n") {
+				if lipgloss.Width(line) != size[0] {
+					t.Fatalf("title screen at %dx%d frame %d: row %d is %d wide", size[0], size[1], frame, i, lipgloss.Width(line))
+				}
+			}
+		}
+	}
+}
+
+func TestTitleScreenKeepsTheWordmarkCenteredAboveTheMenu(t *testing.T) {
+	view := plain(renderPicker(0, 0, 120, 36))
+	lines := strings.Split(view, "\n")
+	find := func(needle string) (int, int) {
+		for row, line := range lines {
+			if column := strings.Index(line, needle); column >= 0 {
+				return row, column
+			}
+		}
+		t.Fatalf("title screen should contain %q:\n%s", needle, view)
+		return 0, 0
+	}
+	wordRow, wordColumn := find("____  __  ___")
+	menuRow, _ := find("▸ Overview")
+	if menuRow <= wordRow {
+		t.Fatalf("menu (row %d) should sit beneath the wordmark (row %d)", menuRow, wordRow)
+	}
+	// The first wordmark line is indented three columns within the 36-column art.
+	wordmarkLeft := wordColumn - 3
+	if leftGap, rightGap := wordmarkLeft, 120-(wordmarkLeft+36); leftGap < rightGap-4 || leftGap > rightGap+4 {
+		t.Fatalf("wordmark should be centred, got gaps %d and %d", leftGap, rightGap)
+	}
+}
+
+func TestTitleBackdropShowsTheChainAndCharts(t *testing.T) {
+	view := plain(renderPicker(0, 0, 200, 50))
+	for _, want := range []string{"#912,40", "NEXT", "mempool", "INCOMING TRANSACTION FLOW", "NETWORK HASHRATE", "TRANSACTION VALUES", "8k │", "2m ago"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("title backdrop should contain %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestTitleBackdropAnimates(t *testing.T) {
+	first := plain(renderPicker(0, 0, 160, 44))
+	later := plain(renderPicker(0, 2, 160, 44))
+	if first == later {
+		t.Fatal("the backdrop should move between frames")
+	}
+	if renderPicker(0, 5, 160, 44) != renderPicker(0, 5, 160, 44) {
+		t.Fatal("a frame should be a pure function of its number")
+	}
+	// The menu stays put while the background scrolls.
+	for _, frame := range []int{0, 2} {
+		if !strings.Contains(plain(renderPicker(1, frame, 160, 44)), "▸ Recent Blocks") {
+			t.Fatalf("frame %d lost the selection marker", frame)
+		}
+	}
+}
+
+func TestTitleBackdropNeverBleedsIntoTheBox(t *testing.T) {
+	view := plain(renderPicker(0, 13, 200, 50))
+	lines := strings.Split(view, "\n")
+	top := -1
+	for row, line := range lines {
+		if strings.Contains(line, "╭────────────────────────────────────────────────────────────────────────────╮") {
+			top = row
+			break
+		}
+	}
+	if top < 0 {
+		t.Fatalf("expected the title box:\n%s", view)
+	}
+	left := strings.Index(lines[top], "╭")
+	for row := top; row < len(lines); row++ {
+		line := []rune(lines[row])
+		if line[left] == '╰' {
+			break
+		}
+		if line[left] != '│' && line[left] != '╭' {
+			t.Fatalf("row %d: box edge broken at column %d: %q", row, left, string(line))
+		}
+		// The margin either side of the border stays clear of the backdrop.
+		if line[left-1] != ' ' || line[left-2] != ' ' {
+			t.Fatalf("row %d: backdrop touches the box: %q", row, string(line))
+		}
+	}
+}
+
+func TestSmallTitleScreenDropsTheBackdrop(t *testing.T) {
+	view := plain(renderPicker(0, 4, 60, 20))
+	for _, absent := range []string{"INCOMING", "HASHRATE", "TRANSACTION VALUES"} {
+		if strings.Contains(view, absent) {
+			t.Fatalf("a small terminal should not squeeze in %q:\n%s", absent, view)
+		}
+	}
+	if !strings.Contains(view, "▸ Overview") || lipgloss.Height(view) != 20 {
+		t.Fatalf("the small title screen should still hold the menu at full height:\n%s", view)
+	}
+}
+
+func TestLoadingScreenSharesTheAnimatedBackdrop(t *testing.T) {
+	first := renderLoadingScreen(modules[2], nil, 0, 140, 40)
+	later := renderLoadingScreen(modules[2], nil, 3, 140, 40)
+	if first == later {
+		t.Fatal("the loading screen should animate")
+	}
+	for _, want := range []string{"LOADING RECENT BLOCKS", "░", "▓", "#912,40", "INCOMING TRANSACTION FLOW"} {
+		if !strings.Contains(plain(later), want) {
+			t.Fatalf("loading screen should contain %q:\n%s", want, plain(later))
+		}
+	}
+	if lipgloss.Width(later) != 140 || lipgloss.Height(later) != 40 {
+		t.Fatalf("loading screen rendered at %dx%d", lipgloss.Width(later), lipgloss.Height(later))
+	}
+	delayed := plain(renderLoadingScreen(modules[2], errors.New("dial tcp: connection refused"), 3, 140, 40))
+	if !strings.Contains(delayed, "CONNECTION DELAYED") || !strings.Contains(delayed, "connection refused") {
+		t.Fatalf("a failed fetch should be explained on the loading screen:\n%s", delayed)
+	}
+}
+
+func TestTitleTicksAdvanceOnlyWhileAnimating(t *testing.T) {
+	m := newModel("")
+	if m.Init() == nil {
+		t.Fatal("the launcher should start its animation")
+	}
+	updated, cmd := m.Update(titleTickMsg{gen: m.animGen})
+	m = updated.(model)
+	if m.frame != 1 || cmd == nil {
+		t.Fatalf("a tick should advance the frame and schedule the next, got frame %d", m.frame)
+	}
+	updated, cmd = m.Update(titleTickMsg{gen: m.animGen + 1})
+	m = updated.(model)
+	if m.frame != 1 || cmd != nil {
+		t.Fatal("a tick from a retired chain should be ignored")
+	}
+
+	// Opening a module keeps animating until the first snapshot lands.
+	updated, _ = m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	m = updated.(model)
+	if !m.wantsAnimation() {
+		t.Fatal("the loading screen should keep the animation running")
+	}
+	updated, _ = m.Update(overviewMsg{snapshot: sampleOverview()})
+	m = updated.(model)
+	updated, cmd = m.Update(titleTickMsg{gen: m.animGen})
+	m = updated.(model)
+	if m.frame != 1 || cmd != nil {
+		t.Fatal("a live module should not keep ticking the title animation")
+	}
+
+	// Returning to the launcher starts a fresh chain.
+	gen := m.animGen
+	updated, cmd = m.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	m = updated.(model)
+	if m.animGen == gen || cmd == nil || !m.wantsAnimation() {
+		t.Fatal("escaping to the launcher should restart the animation")
+	}
+	if m.liveStop != nil {
+		t.Fatal("escaping should have closed the live stream")
+	}
+}
+
+func TestModuleScreenShowsTheLoadingScreenUntilTheFirstSnapshot(t *testing.T) {
+	m := newModel("mining")
+	m.width, m.height = 120, 40
+	view := plain(m.View().Content)
+	if !strings.Contains(view, "LOADING MINING") || !strings.Contains(view, "#912,40") {
+		t.Fatalf("a module without data should show the animated loading screen:\n%s", view)
+	}
+	updated, _ := m.Update(overviewMsg{snapshot: sampleOverview()})
+	m = updated.(model)
+	view = plain(m.View().Content)
+	if strings.Contains(view, "LOADING MINING") || strings.Contains(view, "#912,40") {
+		t.Fatalf("once data arrives the module should replace the loading screen:\n%s", view)
+	}
+}
+
+func BenchmarkTitleScreenFrame(b *testing.B) {
+	for i := range b.N {
+		renderPicker(0, i, 250, 70)
+	}
+}
+
+func TestBlockStackColoursConfirmedGreenAndProjectedOrange(t *testing.T) {
+	snap := sampleOverview()
+	stack := renderBlockStack(&overviewRenderCache{}, snap.ProjectedBlocks[:1], snap.Blocks[:1], newLayout(120, 40), 34, 16, 0, 0, "")
+	// A border is one styled run, so look for the colour's opening sequence
+	// immediately before the card's top-left corner.
+	openSequence := func(color color.Color) string {
+		open, _, _ := strings.Cut(lipgloss.NewStyle().Foreground(color).Render("\x00"), "\x00")
+		return open + "╭"
+	}
+	projectedBorder := openSequence(orange)
+	confirmedBorder := openSequence(green)
+	if !strings.Contains(stack, projectedBorder) {
+		t.Fatalf("projected block cards should have an orange border:\n%s", stack)
+	}
+	if !strings.Contains(stack, confirmedBorder) {
+		t.Fatalf("confirmed block cards should have a green border:\n%s", stack)
+	}
+	if !strings.Contains(stack, confirmedText.Render("#900,123")) {
+		t.Fatalf("confirmed heights should be green:\n%s", stack)
+	}
+}
+
+func TestBlockStackShowsHowFullEachBlockIs(t *testing.T) {
+	snap := sampleOverview()
+	snap.ProjectedBlocks[0].BlockVSize = 500_000
+	snap.Blocks[0].Weight = 3_000_000
+	cards := plain(renderBlockStack(&overviewRenderCache{}, snap.ProjectedBlocks[:1], snap.Blocks[:1], newLayout(120, 40), 34, 16, 0, 0, ""))
+	// The card gauge has 21 cells of four units each.
+	for _, want := range []string{"⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣤⠂⠂⠂⠂⠂⠂⠂⠂⠂⠂  50%", "⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⠂⠂⠂⠂⠂  75%"} {
+		if !strings.Contains(cards, want) {
+			t.Fatalf("block cards should carry a capacity gauge %q:\n%s", want, cards)
+		}
+	}
+	rows := plain(renderBlockStack(&overviewRenderCache{}, snap.ProjectedBlocks[:1], snap.Blocks[:1], newLayout(80, 30), 76, 12, 0, 0, ""))
+	for _, want := range []string{"⣿⣿⣿⣿⠂⠂⠂⠂  50%", "⣿⣿⣿⣿⣿⣿⠂⠂  75%"} {
+		if !strings.Contains(rows, want) {
+			t.Fatalf("block rows should carry a compact capacity gauge %q:\n%s", want, rows)
+		}
+	}
+}
+
+func TestCapacityGaugeFillsCellByCell(t *testing.T) {
+	gauge := plain(capacityGauge(0.3125, 13, confirmedText))
+	if gauge != "⣿⣿⣤⠂⠂⠂⠂⠂  31%" {
+		t.Fatalf("gauge = %q", gauge)
+	}
+	if narrow := plain(capacityGauge(0.5, 6, confirmedText)); narrow != " 50%" {
+		t.Fatalf("a gauge too narrow for cells should fall back to the percentage, got %q", narrow)
 	}
 }

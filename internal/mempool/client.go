@@ -128,6 +128,60 @@ type Transaction struct {
 	Value int64   `json:"value"`
 }
 
+// TransactionDetail is the full transaction shape returned by the explorer
+// endpoint. Prevout carries the UTXO consumed by an input; Vout contains the
+// newly-created transaction outputs.
+type TransactionDetail struct {
+	TxID     string              `json:"txid"`
+	Version  int                 `json:"version"`
+	Locktime uint32              `json:"locktime"`
+	Size     int64               `json:"size"`
+	Weight   int64               `json:"weight"`
+	Fee      int64               `json:"fee"`
+	Vin      []TransactionInput  `json:"vin"`
+	Vout     []TransactionOutput `json:"vout"`
+	Status   TransactionStatus   `json:"status"`
+}
+
+type TransactionInput struct {
+	TxID         string             `json:"txid"`
+	Vout         uint32             `json:"vout"`
+	Prevout      *TransactionOutput `json:"prevout"`
+	ScriptSig    string             `json:"scriptsig"`
+	ScriptSigAsm string             `json:"scriptsig_asm"`
+	Witness      []string           `json:"witness"`
+	IsCoinbase   bool               `json:"is_coinbase"`
+	Sequence     uint32             `json:"sequence"`
+}
+
+type TransactionOutput struct {
+	ScriptPubKey        string `json:"scriptpubkey"`
+	ScriptPubKeyAsm     string `json:"scriptpubkey_asm"`
+	ScriptPubKeyType    string `json:"scriptpubkey_type"`
+	ScriptPubKeyAddress string `json:"scriptpubkey_address"`
+	Value               int64  `json:"value"`
+}
+
+type TransactionStatus struct {
+	Confirmed   bool   `json:"confirmed"`
+	BlockHeight int64  `json:"block_height"`
+	BlockHash   string `json:"block_hash"`
+	BlockTime   int64  `json:"block_time"`
+}
+
+type Outspend struct {
+	Spent  bool              `json:"spent"`
+	TxID   string            `json:"txid"`
+	Vin    int               `json:"vin"`
+	Status TransactionStatus `json:"status"`
+}
+
+type TransactionInspection struct {
+	Transaction TransactionDetail
+	RawHex      string
+	Outspends   []Outspend
+}
+
 type Prices struct {
 	USD float64 `json:"USD"`
 }
@@ -246,6 +300,60 @@ func (c *Client) FetchBlockHistory(ctx context.Context, tip int64, pages int) ([
 		history = append(history, blocks...)
 	}
 	return history, nil
+}
+
+// FetchTransaction loads the decoded transaction, its raw serialization, and
+// output-spend state concurrently so the viewer can describe both sides of
+// the UTXO exchange without serial request latency.
+func (c *Client) FetchTransaction(ctx context.Context, txid string) (TransactionInspection, error) {
+	type result struct {
+		name string
+		err  error
+	}
+	var inspection TransactionInspection
+	results := make(chan result, 3)
+	go func() {
+		results <- result{"transaction", c.getJSON(ctx, "/tx/"+txid, &inspection.Transaction)}
+	}()
+	go func() {
+		var raw []byte
+		err := c.get(ctx, "/tx/"+txid+"/hex", &raw)
+		if err == nil {
+			inspection.RawHex = strings.TrimSpace(string(raw))
+		}
+		results <- result{"transaction hex", err}
+	}()
+	go func() {
+		results <- result{"output spends", c.getJSON(ctx, "/tx/"+txid+"/outspends", &inspection.Outspends)}
+	}()
+	for range 3 {
+		item := <-results
+		if item.err != nil {
+			return TransactionInspection{}, fmt.Errorf("fetch %s: %w", item.name, item.err)
+		}
+	}
+	return inspection, nil
+}
+
+func (c *Client) get(ctx context.Context, path string, target *[]byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "text/plain")
+	req.Header.Set("User-Agent", "ompool/dev")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return fmt.Errorf("unexpected HTTP status %s", resp.Status)
+	}
+	*target, err = io.ReadAll(resp.Body)
+	return err
 }
 
 func (c *Client) getJSON(ctx context.Context, path string, target any) error {
