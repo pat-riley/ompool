@@ -68,6 +68,51 @@ func TestFetchOverviewRejectsBadStatus(t *testing.T) {
 	}
 }
 
+func TestFetchMining(t *testing.T) {
+	client := NewClient("https://example.test/api")
+	client.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/api/v1/mining/hashrate/3m":
+			return response(http.StatusOK, `{"hashrates":[{"timestamp":1700000000,"avgHashrate":9e20}],"difficulty":[{"time":1699000000,"height":800000,"difficulty":1.2e14,"adjustment":1.02}],"currentHashrate":9.2e20,"currentDifficulty":1.25e14}`), nil
+		case "/api/v1/mining/pools/1w":
+			return response(http.StatusOK, `{"pools":[{"name":"Foundry USA","blockCount":31,"rank":1,"avgMatchRate":98.2}],"blockCount":100,"lastEstimatedHashrate":9.1e20}`), nil
+		case "/api/v1/mining/reward-stats/144":
+			return response(http.StatusOK, `{"startBlock":900000,"endBlock":900143,"totalReward":"45360000000","totalFee":"360000000","totalTx":"650000"}`), nil
+		default:
+			return response(http.StatusNotFound, "not found"), nil
+		}
+	})
+
+	mining, err := client.FetchMining(context.Background())
+	if err != nil {
+		t.Fatalf("FetchMining() error = %v", err)
+	}
+	if mining.Hashrate.CurrentHashrate != 9.2e20 || mining.Pools.Pools[0].Name != "Foundry USA" || mining.Rewards.TotalTx != "650000" {
+		t.Fatalf("unexpected mining snapshot: %+v", mining)
+	}
+}
+
+func TestFetchBlockHistoryKeepsConcurrentPagesInChainOrder(t *testing.T) {
+	client := NewClient("https://example.test/api")
+	client.http.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		switch r.URL.Path {
+		case "/api/v1/blocks/985":
+			return response(http.StatusOK, `[{"id":"page-one","height":985}]`), nil
+		case "/api/v1/blocks/970":
+			return response(http.StatusOK, `[{"id":"page-two","height":970}]`), nil
+		default:
+			return response(http.StatusNotFound, "not found"), nil
+		}
+	})
+	blocks, err := client.FetchBlockHistory(context.Background(), 1000, 2)
+	if err != nil {
+		t.Fatalf("FetchBlockHistory() error = %v", err)
+	}
+	if len(blocks) != 2 || blocks[0].Height != 985 || blocks[1].Height != 970 {
+		t.Fatalf("history out of order: %+v", blocks)
+	}
+}
+
 func TestCoalesceLiveStats(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

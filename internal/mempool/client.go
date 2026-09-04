@@ -39,11 +39,68 @@ type Block struct {
 	Size      int64  `json:"size"`
 	Weight    int64  `json:"weight"`
 	Extras    struct {
-		Pool struct {
+		Reward        int64     `json:"reward"`
+		MedianFee     float64   `json:"medianFee"`
+		FeeRange      []float64 `json:"feeRange"`
+		TotalFees     int64     `json:"totalFees"`
+		AvgFee        int64     `json:"avgFee"`
+		AvgFeeRate    float64   `json:"avgFeeRate"`
+		AvgTxSize     float64   `json:"avgTxSize"`
+		SegwitTotalTx int       `json:"segwitTotalTxs"`
+		MatchRate     float64   `json:"matchRate"`
+		Pool          struct {
 			Name string `json:"name"`
 			Slug string `json:"slug"`
 		} `json:"pool"`
 	} `json:"extras"`
+}
+
+type HashratePoint struct {
+	Timestamp   int64   `json:"timestamp"`
+	AvgHashrate float64 `json:"avgHashrate"`
+}
+
+type DifficultyPoint struct {
+	Time       int64   `json:"time"`
+	Height     int64   `json:"height"`
+	Difficulty float64 `json:"difficulty"`
+	Adjustment float64 `json:"adjustment"`
+}
+
+type HashrateStats struct {
+	Hashrates         []HashratePoint   `json:"hashrates"`
+	Difficulty        []DifficultyPoint `json:"difficulty"`
+	CurrentHashrate   float64           `json:"currentHashrate"`
+	CurrentDifficulty float64           `json:"currentDifficulty"`
+}
+
+type MiningPool struct {
+	Name         string  `json:"name"`
+	Slug         string  `json:"slug"`
+	BlockCount   int     `json:"blockCount"`
+	Rank         int     `json:"rank"`
+	EmptyBlocks  int     `json:"emptyBlocks"`
+	AvgMatchRate float64 `json:"avgMatchRate"`
+}
+
+type PoolStats struct {
+	Pools                 []MiningPool `json:"pools"`
+	BlockCount            int          `json:"blockCount"`
+	LastEstimatedHashrate float64      `json:"lastEstimatedHashrate"`
+}
+
+type RewardStats struct {
+	StartBlock  int64  `json:"startBlock"`
+	EndBlock    int64  `json:"endBlock"`
+	TotalReward string `json:"totalReward"`
+	TotalFee    string `json:"totalFee"`
+	TotalTx     string `json:"totalTx"`
+}
+
+type MiningStats struct {
+	Hashrate HashrateStats
+	Pools    PoolStats
+	Rewards  RewardStats
 }
 
 type ProjectedBlock struct {
@@ -83,6 +140,7 @@ type Overview struct {
 	Difficulty      DifficultyAdjustment
 	Recent          []Transaction
 	Prices          Prices
+	Mining          MiningStats
 	Fetched         time.Time
 }
 
@@ -131,6 +189,63 @@ func (c *Client) FetchOverview(ctx context.Context) (Overview, error) {
 	}
 	snapshot.Fetched = time.Now()
 	return snapshot, nil
+}
+
+// FetchMining loads slower-moving mining analytics independently from the
+// core snapshot so screens that do not display them avoid the extra requests.
+func (c *Client) FetchMining(ctx context.Context) (MiningStats, error) {
+	type result struct {
+		name string
+		err  error
+	}
+	var mining MiningStats
+	results := make(chan result, 3)
+	go func() { results <- result{"hashrate", c.getJSON(ctx, "/v1/mining/hashrate/3m", &mining.Hashrate)} }()
+	go func() { results <- result{"pools", c.getJSON(ctx, "/v1/mining/pools/1w", &mining.Pools)} }()
+	go func() { results <- result{"rewards", c.getJSON(ctx, "/v1/mining/reward-stats/144", &mining.Rewards)} }()
+	for range 3 {
+		item := <-results
+		if item.err != nil {
+			return MiningStats{}, fmt.Errorf("fetch mining %s: %w", item.name, item.err)
+		}
+	}
+	return mining, nil
+}
+
+// FetchBlockHistory requests older v1 block pages concurrently. The caller
+// supplies the current tip, allowing deterministic non-overlapping 15-block
+// windows without a serial pagination waterfall.
+func (c *Client) FetchBlockHistory(ctx context.Context, tip int64, pages int) ([]Block, error) {
+	if tip <= 0 || pages <= 0 {
+		return nil, nil
+	}
+	type result struct {
+		page   int
+		blocks []Block
+		err    error
+	}
+	results := make(chan result, pages)
+	for page := range pages {
+		go func() {
+			start := tip - int64((page+1)*15)
+			var blocks []Block
+			err := c.getJSON(ctx, fmt.Sprintf("/v1/blocks/%d", start), &blocks)
+			results <- result{page: page, blocks: blocks, err: err}
+		}()
+	}
+	ordered := make([][]Block, pages)
+	for range pages {
+		item := <-results
+		if item.err != nil {
+			return nil, fmt.Errorf("fetch block history page %d: %w", item.page+1, item.err)
+		}
+		ordered[item.page] = item.blocks
+	}
+	var history []Block
+	for _, blocks := range ordered {
+		history = append(history, blocks...)
+	}
+	return history, nil
 }
 
 func (c *Client) getJSON(ctx context.Context, path string, target any) error {
