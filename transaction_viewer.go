@@ -11,7 +11,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"ompool/internal/mempool"
+	"github.com/pat-riley/ompool/internal/mempool"
 )
 
 const (

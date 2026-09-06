@@ -1,83 +1,132 @@
 # ompool
 
-A Bitcoin mempool and blockchain monitor for the terminal, built for Omarchy.
+A live Bitcoin mempool and blockchain dashboard for the terminal, with an
+optional SuperCollider instrument that plays the network as it happens.
 
-Run `ompool` to open the title screen: the module picker sits in the centre
-while a dimmed chain of blocks scrolls above it and dummy flow, hashrate, and
-transaction value charts play beneath. The same backdrop runs while a module
-fetches its first snapshot. You can also open a module directly:
+Every transaction entering the mempool becomes a plucked note: small amounts
+high, whales low, cheap fees left, urgent fees right. New blocks land as a gong
+and step a chord progression. Fee pressure sets the harmonic tension, mempool
+inflow sets the drum density, and the tempo itself follows how busy the network
+is.
 
-```text
-ompool overview
-ompool audio
-ompool blockchain
-ompool blocks
-ompool transactions
-ompool viewer
-ompool mempool
-ompool fees
-ompool difficulty
-ompool mining
-ompool lightning
-ompool explorer
+## Install
+
+With Go 1.27 or newer:
+
+```bash
+go install github.com/pat-riley/ompool@latest
 ```
 
-Dashboard modules use a concurrently fetched network snapshot and a coalesced
-live websocket stream, then refresh the snapshot every 15 seconds. Dedicated
-views are available for the chain, confirmed blocks, live transactions, the
-mempool, fees, and difficulty adjustment. To use a self-hosted mempool
-instance, set `OMPOOL_API_URL` to its API base URL.
+Prebuilt binaries for Linux, macOS, and Windows are attached to each
+[release](https://github.com/pat-riley/ompool/releases).
 
-ompool also mirrors what it shows as OSC messages over UDP, so an external
-instrument (SuperCollider, Max, etc.) can play in sync with the dashboard.
-Messages go to `OMPOOL_OSC_ADDR` (default `127.0.0.1:57120`, sclang's port);
-set `OMPOOL_OSC=off` to disable. All arguments are float32:
+For sound you also need [SuperCollider](https://supercollider.github.io/downloads)
+installed so that `sclang` is on your PATH, and a running audio server that it
+can use (PipeWire or JACK on Linux, CoreAudio on macOS). The dashboard works
+without it.
+
+```bash
+sudo pacman -S supercollider      # Arch
+sudo apt install supercollider    # Debian / Ubuntu
+brew install --cask supercollider # macOS
+```
+
+## Usage
+
+`ompool` opens the title screen and module picker. You can also open a module
+directly:
 
 ```text
-/btc/tx       value_sats fee_rate_sat_per_vb      sent as each transaction is revealed on screen
-/btc/block    height tx_count                     sent when a new block is detected
+ompool overview        the complete network dashboard
+ompool audio           the overview, sonified
+ompool blocks          a live feed of newly mined blocks
+ompool transactions    live transactions entering the mempool
+ompool viewer          inspect a transaction, its UTXOs, hex, and embedded data
+ompool mempool         backlog, weight, and activity
+ompool mining          hashrate, rewards, and pool distribution
+```
+
+Press `Esc` to return to the picker and `q` to quit. Dashboard modules fetch a
+network snapshot, subscribe to a live websocket stream, and refresh the
+snapshot every 15 seconds. Data comes from the public
+[mempool.space](https://mempool.space) API; set `OMPOOL_API_URL` to the API
+base URL of a self-hosted instance to use that instead.
+
+### Audio
+
+`ompool audio` is the overview with two differences. Transactions are revealed
+one per step of a musical clock rather than as they arrive, and the tempo
+follows the network: transaction inflow and the mempool backlog map onto 70 bpm
+(idle) to 160 bpm (saturated), easing between values so the beat never lurches.
+A Tempo panel shows the bpm, the beat, recent history, and the launcher status.
+
+When the view opens, ompool starts `sclang` on the instrument embedded in the
+binary, and stops it again when you leave. Booting takes a few seconds. If
+something already holds the OSC port, typically SuperCollider's IDE, ompool
+feeds that instead of launching a second copy, so you can edit the instrument
+live:
+
+```bash
+ompool instrument > my-instrument.scd   # dump the embedded script
+ompool instrument --test-sender > test.scd   # a fake feed for auditioning it
+```
+
+Open the script in SCIDE, evaluate the whole block, then run `ompool audio`.
+To have ompool launch your edited version itself, point `OMPOOL_INSTRUMENT` at
+the file. The launcher writes the script it runs and `instrument.log` to
+`~/.cache/ompool` (or the platform equivalent); look there if it goes quiet.
+
+The mapping from data to music is documented at the top of
+[`instrument/ompool.scd`](instrument/ompool.scd).
+
+### Transaction viewer
+
+Paste a transaction ID or a mempool.space transaction URL and press Enter to
+inspect inputs, output UTXOs and spend state, decoded metadata, and embedded
+payload hex. `Shift+L` loads the Len Sassaman ASCII-art tribute and `Shift+G`
+the genesis coinbase with its Times headline. `Tab` moves the scroll focus
+between columns.
+
+## OSC protocol
+
+ompool mirrors what it shows as OSC messages over UDP, so any instrument
+(SuperCollider, Max, Pure Data, a DAW) can play in sync with the screen. All
+arguments are float32.
+
+```text
+/btc/tx       value_sats fee_rate_sat_per_vb      as each transaction is revealed on screen
+/btc/block    height tx_count                     when a new block is detected
 /btc/fees     fastest halfHour hour economy min   sat/vB, from each snapshot
 /btc/mempool  count vsize vbytes_per_second       from snapshots and live flow updates
 /btc/clock    bpm step steps_per_bar              audio view only: one per grid step
 ```
 
-Audio Export (`ompool audio`) is the overview with two differences. Instead of
-the free-running reveal pulse, transactions are revealed one per grid step of a
-musical clock, so an instrument driven by the OSC feed plays in time with the
-screen. And the tempo follows the network: busyness is derived from transaction
-inflow (vB/s) and the mempool backlog, and mapped onto 70 bpm (idle) to 160 bpm
-(saturated), easing between values so the beat never lurches. A Tempo panel
-replaces Difficulty and Fee Market, showing the bpm on the 70–160 gauge, a beat
-indicator, recent history, and the inputs driving it. `OMPOOL_BPM` pins the
-tempo instead, and `OMPOOL_STEP` sets steps per 4/4 bar (default 8, eighth
-notes). A `/btc/clock` message accompanies every step so the instrument can
-lock its own sequencer to the same bar.
+The clock message lets an instrument lock its own sequencer to ompool's bar;
+the embedded instrument adopts the tempo and re-aligns on each bar start.
 
-Transaction Viewer is available from the home screen or with `ompool viewer`.
-Paste a transaction ID (or a mempool.space transaction URL) and press Enter to
-inspect its inputs, output UTXOs and spend state, decoded metadata, and embedded
-payload hex. Press Shift+L for the Len Sassaman ASCII-art tribute or Shift+G
-for the genesis coinbase and its Times headline. On wide terminals, inputs,
-outputs, and on-chain data each occupy an equal-width column; the UTXO columns
-show only address, direction, and BTC amount. Tab switches the scroll focus
-between them.
+## Configuration
 
-Mining provides a three-month line chart overlaying raw hashrate, its seven-day
-moving average, and difficulty; reward summaries; a 100-cell pool-share
-mosaic; and recent difficulty adjustments. Lightning and Explorer remain
-available as direct-command scaffolds but are hidden from the focused launcher.
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `OMPOOL_API_URL` | `https://mempool.space/api` | API base of a self-hosted mempool instance |
+| `OMPOOL_OSC_ADDR` | `127.0.0.1:57120` | Where OSC messages go (sclang's default port) |
+| `OMPOOL_OSC` | | `off` disables OSC output and the instrument |
+| `OMPOOL_INSTRUMENT` | `auto` | `off` never launches sclang; a path runs that `.scd` instead of the embedded one |
+| `OMPOOL_BPM` | | Pin the audio view's tempo instead of following the network |
+| `OMPOOL_STEP` | `8` | Steps per 4/4 bar in the audio view |
 
-The Blockchain and Recent Blocks modules also load two older block pages for
-roughly 45 scrollable blocks. Mining-aware screens fetch three-month network
-hashrate history, seven-day pool distribution, and 144-block reward statistics in parallel;
-other screens skip those requests entirely.
-
-For automatic rebuilds while developing, run:
+## Development
 
 ```bash
-./scripts/dev overview
+git clone https://github.com/pat-riley/ompool
+cd ompool
+go test ./...
+./scripts/dev overview   # rebuild and relaunch on every save (Linux, needs inotify-tools)
 ```
 
-## Status
+See [CONTRIBUTING.md](CONTRIBUTING.md). Releases are cut by pushing a `v*`
+tag; GitHub Actions builds the binaries.
 
-Early development.
+## License
+
+[MIT](LICENSE)

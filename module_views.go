@@ -9,7 +9,7 @@ import (
 
 	"charm.land/lipgloss/v2"
 
-	"ompool/internal/mempool"
+	"github.com/pat-riley/ompool/internal/mempool"
 )
 
 func renderActiveModule(cache *overviewRenderCache, active module, snapshot mempool.Overview, activity []activitySample, txValues []transactionValueSample, loading bool, err error, width, height, blockScroll, txPulse int, newTXIDs map[string]struct{}, blockPulse int, newBlockID string) string {

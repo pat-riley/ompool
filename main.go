@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -12,8 +13,9 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
-	"ompool/internal/mempool"
-	"ompool/internal/osc"
+	"github.com/pat-riley/ompool/instrument"
+	"github.com/pat-riley/ompool/internal/mempool"
+	"github.com/pat-riley/ompool/internal/osc"
 )
 
 type module struct {
@@ -91,6 +93,10 @@ type model struct {
 	// can carry it alongside snapshot counts.
 	osc    *osc.Sender
 	inflow float64
+
+	// instrument is the SuperCollider process the audio view launches to play
+	// the OSC feed (see package instrument); nil outside the audio view.
+	instrument *instrument.Process
 
 	// The audio export view reveals transactions on a tempo grid instead of the
 	// free-running pulse. audioNext is the absolute time of the next step so the
@@ -198,15 +204,37 @@ func newOSCSender() *osc.Sender {
 	if strings.EqualFold(os.Getenv("OMPOOL_OSC"), "off") {
 		return nil
 	}
-	addr := os.Getenv("OMPOOL_OSC_ADDR")
-	if addr == "" {
-		addr = "127.0.0.1:57120"
-	}
-	sender, err := osc.New(addr)
+	sender, err := osc.New(oscAddress())
 	if err != nil {
 		return nil
 	}
 	return sender
+}
+
+// oscAddress is where OSC messages go, and where the instrument launcher
+// tells sclang to listen.
+func oscAddress() string {
+	if addr := os.Getenv("OMPOOL_OSC_ADDR"); addr != "" {
+		return addr
+	}
+	return "127.0.0.1:57120"
+}
+
+// startInstrument launches the embedded SuperCollider instrument for the
+// audio view unless OSC output is off. Re-entering the view reuses a process
+// that is still alive.
+func (m *model) startInstrument() {
+	if m.osc == nil || m.instrument != nil {
+		return
+	}
+	m.instrument = instrument.Start(oscAddress())
+}
+
+// stopInstrument ends the instrument process, if any, when leaving the audio
+// view or quitting.
+func (m *model) stopInstrument() {
+	m.instrument.Stop()
+	m.instrument = nil
 }
 
 // sendStatsOSC publishes fee pressure and mempool size. Both are cheap to
@@ -241,6 +269,7 @@ func newModel(command string) model {
 				m.startLiveStream()
 				if candidate.command == "audio" {
 					m.startAudioClock() // Init schedules the first step
+					m.startInstrument()
 				}
 			}
 			return m
@@ -340,11 +369,12 @@ type audioView struct {
 	history     []float64
 	inflow      float64
 	mempool     int
+	instrument  string // launcher status line, empty to omit
 }
 
 func (m model) audioView() *audioView {
 	bpm, stepsPerBar, _ := m.audioTempo()
-	return &audioView{
+	view := &audioView{
 		title:       m.active.title,
 		bpm:         bpm,
 		busy:        m.audioBusy,
@@ -354,6 +384,12 @@ func (m model) audioView() *audioView {
 		inflow:      m.inflow,
 		mempool:     m.overview.Mempool.Count,
 	}
+	if m.osc == nil {
+		view.instrument = "OSC output off (OMPOOL_OSC=off)"
+	} else if m.instrument != nil {
+		_, view.instrument = m.instrument.Status()
+	}
+	return view
 }
 
 // startAudioClock resets the grid so the first step lands one step from now.
@@ -732,6 +768,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.liveStop != nil {
 			m.liveStop()
 		}
+		m.stopInstrument()
 		return m, tea.Quit
 	case "esc":
 		if m.screen == moduleScreen {
@@ -739,6 +776,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.liveStop()
 				m.liveStop = nil
 			}
+			m.stopInstrument()
 			m.screen = pickerScreen
 			m.err = nil
 			m.spinGen++ // retire the block spinner
@@ -834,6 +872,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds := []tea.Cmd{moduleDataCommands(m.client, m.live, m.active.command)}
 		if m.audioMode() {
 			cmds = append(cmds, m.startAudioClock())
+			m.startInstrument()
 		}
 		if m.showsBlockStack() {
 			m.spinGen++
@@ -1722,6 +1761,9 @@ func renderTempoPanel(audio *audioView, l layout, width int) string {
 		labelText.Render(formatInt(int64(audio.mempool)) + " tx waiting"),
 		labelText.Render(fmt.Sprintf("%d/bar", audio.stepsPerBar)),
 	}, labelText.Render("  ·  "), inner)...)
+	if audio.instrument != "" {
+		lines = append(lines, truncate(labelText.Render(audio.instrument), inner))
+	}
 	return panelStyle.Width(width).Render(strings.Join(lines, "\n"))
 }
 
@@ -2220,6 +2262,24 @@ func main() {
 	command := ""
 	if len(os.Args) > 1 {
 		command = os.Args[1]
+		switch command {
+		case "instrument":
+			// Print the embedded SuperCollider script so it can be opened in
+			// SCIDE and hacked on: ompool instrument > my.scd
+			if len(os.Args) > 2 && os.Args[2] == "--test-sender" {
+				fmt.Print(instrument.TestSender)
+			} else {
+				fmt.Print(instrument.Source)
+			}
+			return
+		case "version", "--version", "-v":
+			fmt.Println("ompool", version())
+			return
+		case "help", "--help", "-h":
+			fmt.Printf("usage: ompool [module]\n\nmodules: %s\n\n", availableCommands())
+			fmt.Print("other commands:\n  instrument [--test-sender]  print the embedded SuperCollider script\n  version                     print the version\n")
+			return
+		}
 		if !validCommand(command) {
 			fmt.Fprintf(os.Stderr, "unknown module %q\n", command)
 			fmt.Fprintf(os.Stderr, "available modules: %s\n", availableCommands())
@@ -2227,10 +2287,22 @@ func main() {
 		}
 	}
 
-	if _, err := tea.NewProgram(newModel(command)).Run(); err != nil {
+	final, err := tea.NewProgram(newModel(command)).Run()
+	if m, ok := final.(model); ok {
+		m.stopInstrument() // covers exits that skip the key handler
+	}
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "ompool: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// version is what `go install` or a release build recorded for this binary.
+func version() string {
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+	return "dev"
 }
 
 func validCommand(command string) bool {
