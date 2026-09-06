@@ -578,9 +578,13 @@ func renderPicker(cursor, frame, width, height int) string {
 		lines = append(lines, "")
 	}
 
-	// Titles are padded into a column only while the descriptions still fit
-	// beside them; below that each row is just the title.
-	const titleColumn = 16
+	// Titles are padded into a column sized to the longest of them, and only
+	// while the descriptions still fit beside them; below that each row is
+	// just the title.
+	titleColumn := 0
+	for _, item := range homeModules() {
+		titleColumn = max(titleColumn, lipgloss.Width(item.title)+2)
+	}
 	showDescription := inner >= titleColumn+30
 	rows := make([]string, 0, len(homeModules()))
 	for i, item := range homeModules() {
