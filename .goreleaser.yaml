@@ -1,5 +1,5 @@
 # Builds release binaries when a v* tag is pushed (see .github/workflows/release.yml).
-# The version shown by `ompool version` comes from the git tag via Go's VCS stamping.
+# The tag is stamped into `ompool version` and the title screen via -X main.buildVersion.
 version: 2
 project_name: ompool
 
@@ -7,7 +7,7 @@ builds:
   - env: [CGO_ENABLED=0]
     goos: [linux, darwin, windows]
     goarch: [amd64, arm64]
-    ldflags: [-s, -w]
+    ldflags: ["-s", "-w", "-X main.buildVersion={{.Version}}"]
 
 archives:
   - formats: [tar.gz]

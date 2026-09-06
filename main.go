@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -250,6 +251,7 @@ func (m *model) sendStatsOSC() {
 }
 
 func newModel(command string) model {
+	mempool.UserAgent = "ompool/" + appVersion
 	m := model{
 		active:      modules[0],
 		client:      mempool.NewClient(os.Getenv("OMPOOL_API_URL")),
@@ -2273,7 +2275,7 @@ func main() {
 			}
 			return
 		case "version", "--version", "-v":
-			fmt.Println("ompool", version())
+			fmt.Println("ompool", appVersion)
 			return
 		case "help", "--help", "-h":
 			fmt.Printf("usage: ompool [module]\n\nmodules: %s\n\n", availableCommands())
@@ -2297,12 +2299,52 @@ func main() {
 	}
 }
 
-// version is what `go install` or a release build recorded for this binary.
-func version() string {
-	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" && info.Main.Version != "(devel)" {
-		return info.Main.Version
+// buildVersion is stamped by release builds (see .goreleaser.yaml) with
+// -X main.buildVersion=<tag>. Leave it empty for local builds.
+var buildVersion string
+
+// pseudoVersion matches what Go stamps into a build from an untagged
+// checkout, e.g. v0.0.0-20260906171007-429639842187+dirty.
+var pseudoVersion = regexp.MustCompile(`-\d{14}-[0-9a-f]{12}`)
+
+// appVersion is what `ompool version` and the title screen show: the release
+// tag, else the module version `go install` recorded, else "dev" plus the
+// commit when built from a checkout.
+var appVersion = versionString(buildVersion, debug.ReadBuildInfo)
+
+func versionString(stamped string, readBuildInfo func() (*debug.BuildInfo, bool)) string {
+	if stamped != "" {
+		return stamped
 	}
-	return "dev"
+	info, ok := readBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	v := info.Main.Version
+	if pseudo := pseudoVersion.FindStringSubmatch(v); pseudo != nil {
+		v = "" // an untagged checkout: report the commit instead
+	} else if v != "" && v != "(devel)" {
+		return v
+	}
+	revision, dirty := "", false
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			dirty = setting.Value == "true"
+		}
+	}
+	if len(revision) > 7 {
+		revision = revision[:7]
+	}
+	if revision == "" {
+		return "dev"
+	}
+	if dirty {
+		return "dev (" + revision + ", modified)"
+	}
+	return "dev (" + revision + ")"
 }
 
 func validCommand(command string) bool {

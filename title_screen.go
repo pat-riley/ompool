@@ -572,8 +572,11 @@ func renderPicker(cursor, frame, width, height int) string {
 	} else {
 		lines = append(lines, centerLines([]string{headerText.Render("OMPOOL")}, inner)...)
 	}
-	tagline := ellipsize("Bitcoin from the terminal", inner)
-	lines = append(lines, centerLines([]string{labelText.Render(tagline)}, inner)...)
+	tagline := "Bitcoin from the terminal"
+	if inner >= lipgloss.Width(tagline)+len(appVersion)+5 {
+		tagline += "  ·  " + appVersion
+	}
+	lines = append(lines, centerLines([]string{labelText.Render(ellipsize(tagline, inner))}, inner)...)
 	if height >= 16 {
 		lines = append(lines, "")
 	}
