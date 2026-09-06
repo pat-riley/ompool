@@ -23,6 +23,7 @@ func TestVersionString(t *testing.T) {
 		{"checkout with commit", "", info("(devel)", debug.BuildSetting{Key: "vcs.revision", Value: "0123456789abcdef"}), "dev (0123456)"},
 		{"modified checkout", "", info("(devel)", debug.BuildSetting{Key: "vcs.revision", Value: "0123456789abcdef"}, debug.BuildSetting{Key: "vcs.modified", Value: "true"}), "dev (0123456, modified)"},
 		{"pseudo-version from an untagged checkout", "", info("v0.0.0-20260906171007-429639842187+dirty", debug.BuildSetting{Key: "vcs.revision", Value: "429639842187abcd"}, debug.BuildSetting{Key: "vcs.modified", Value: "true"}), "dev (4296398, modified)"},
+		{"pseudo-version after a tag", "", info("v0.1.1-0.20260906172307-a9113694cf93", debug.BuildSetting{Key: "vcs.revision", Value: "a9113694cf93abcd"}), "dev (a911369)"},
 		{"no build info", "", none, "dev"},
 	}
 	for _, tc := range cases {

@@ -2304,8 +2304,9 @@ func main() {
 var buildVersion string
 
 // pseudoVersion matches what Go stamps into a build from an untagged
-// checkout, e.g. v0.0.0-20260906171007-429639842187+dirty.
-var pseudoVersion = regexp.MustCompile(`-\d{14}-[0-9a-f]{12}`)
+// checkout, e.g. v0.0.0-20260906171007-429639842187+dirty or, after a tag,
+// v0.1.1-0.20260906172307-a9113694cf93.
+var pseudoVersion = regexp.MustCompile(`\d{14}-[0-9a-f]{12}`)
 
 // appVersion is what `ompool version` and the title screen show: the release
 // tag, else the module version `go install` recorded, else "dev" plus the
