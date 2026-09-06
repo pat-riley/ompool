@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 	"charm.land/lipgloss/v2"
 
 	"ompool/internal/mempool"
+	"ompool/internal/osc"
 )
 
 type module struct {
@@ -31,6 +33,7 @@ var modules = []module{
 	{command: "fees", title: "Fees", description: "Current fee estimates and recent trends", hidden: true},
 	{command: "difficulty", title: "Difficulty", description: "Retarget progress and mining cadence", hidden: true},
 	{command: "mining", title: "Mining", description: "Hashrate, rewards, and pool distribution"},
+	{command: "audio", title: "Audio Export", description: "The overview, with transactions revealed on a musical grid"},
 	{command: "lightning", title: "Lightning", description: "Lightning Network capacity and activity", hidden: true},
 	{command: "explorer", title: "Explorer", description: "Inspect blocks, transactions, and addresses", hidden: true},
 }
@@ -83,6 +86,31 @@ type model struct {
 	renderCache *overviewRenderCache
 	viewer      transactionViewerState
 
+	// osc mirrors what the dashboard shows to an external instrument (see
+	// newOSCSender); inflow is the latest vBytesPerSecond so mempool messages
+	// can carry it alongside snapshot counts.
+	osc    *osc.Sender
+	inflow float64
+
+	// The audio export view reveals transactions on a tempo grid instead of the
+	// free-running pulse. audioNext is the absolute time of the next step so the
+	// clock does not drift; audioGen retires ticks from a previous visit.
+	audioGen  int
+	audioStep int
+	audioNext time.Time
+
+	// Tempo follows how busy the network is (see busyness): audioBPM glides
+	// toward the target so the beat never lurches; tempoHistory keeps recent
+	// samples for the view's sparkline.
+	audioBPM     float64
+	audioBusy    float64
+	tempoHistory []float64
+
+	// spin animates the unconfirmed-block marker while a block stack is on
+	// screen; spinGen retires the tick chain when the view changes.
+	spin    int
+	spinGen int
+
 	// frame drives the title and loading screen animations; animGen lets a
 	// restarted tick chain retire any older one still in flight.
 	frame   int
@@ -102,10 +130,24 @@ type overviewRenderCache struct {
 	difficulty   renderFragment
 	transactions renderFragment
 	fees         renderFragment
+	tempo        renderFragment
 
 	// blockMaxScroll is written by the block panel once it knows how many rows
 	// it can actually show, so key handling can clamp against the real bound.
 	blockMaxScroll int
+
+	// spinFrame is the current frame of the spinner shown on unconfirmed
+	// blocks; the model sets it before each render.
+	spinFrame int
+}
+
+// spinnerFrames animate the "still being mined" marker on projected blocks.
+var spinnerFrames = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+
+const spinInterval = 120 * time.Millisecond
+
+func spinner(frame int) string {
+	return spinnerFrames[((frame%len(spinnerFrames))+len(spinnerFrames))%len(spinnerFrames)]
 }
 
 func (c *overviewRenderCache) invalidateAll() {
@@ -118,6 +160,7 @@ func (c *overviewRenderCache) invalidateOverview() {
 	c.blocks.valid = false
 	c.difficulty.valid = false
 	c.transactions.valid = false
+	c.tempo.valid = false
 	c.fees.valid = false
 }
 
@@ -147,11 +190,43 @@ type transactionValueSample struct {
 // available rows instead of stopping at the API's initial ten-item snapshot.
 const recentTransactionLimit = 24
 
+// newOSCSender wires up OSC output for sonification. Messages go to
+// OMPOOL_OSC_ADDR (default 127.0.0.1:57120, SuperCollider's sclang port);
+// OMPOOL_OSC=off disables it. A nil sender is a no-op, so failures never
+// affect the dashboard.
+func newOSCSender() *osc.Sender {
+	if strings.EqualFold(os.Getenv("OMPOOL_OSC"), "off") {
+		return nil
+	}
+	addr := os.Getenv("OMPOOL_OSC_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:57120"
+	}
+	sender, err := osc.New(addr)
+	if err != nil {
+		return nil
+	}
+	return sender
+}
+
+// sendStatsOSC publishes fee pressure and mempool size. Both are cheap to
+// resend, and the receiver treats them as current state rather than events.
+func (m *model) sendStatsOSC() {
+	if m.osc == nil {
+		return
+	}
+	fees := m.overview.Fees
+	m.osc.Send("/btc/fees", float32(fees.Fastest), float32(fees.HalfHour), float32(fees.Hour), float32(fees.Economy), float32(fees.Minimum))
+	pool := m.overview.Mempool
+	m.osc.Send("/btc/mempool", float32(pool.Count), float32(pool.VSize), float32(m.inflow))
+}
+
 func newModel(command string) model {
 	m := model{
 		active:      modules[0],
 		client:      mempool.NewClient(os.Getenv("OMPOOL_API_URL")),
 		renderCache: &overviewRenderCache{},
+		osc:         newOSCSender(),
 	}
 	if command == "" {
 		return m
@@ -164,12 +239,145 @@ func newModel(command string) model {
 			if candidate.command != "viewer" {
 				m.loading = true
 				m.startLiveStream()
+				if candidate.command == "audio" {
+					m.startAudioClock() // Init schedules the first step
+				}
 			}
 			return m
 		}
 	}
 
 	return m
+}
+
+// ---- audio export view: transactions on a musical grid ----
+
+type audioStepMsg struct{ gen, step int }
+
+type spinTickMsg struct{ gen int }
+
+func (m model) showsBlockStack() bool {
+	return m.screen == moduleScreen && moduleScrollsBlocks(m.active.command)
+}
+
+func scheduleSpin(gen int) tea.Cmd {
+	return tea.Tick(spinInterval, func(time.Time) tea.Msg { return spinTickMsg{gen: gen} })
+}
+
+// The tempo range the network is mapped onto: an empty mempool idles at
+// minTempoBPM, a saturated one races at maxTempoBPM.
+const (
+	minTempoBPM = 70.0
+	maxTempoBPM = 160.0
+)
+
+// busyness folds the two things that make the network feel busy into 0..1:
+// how fast transactions are arriving (vB/s) and how deep the backlog is (tx
+// count). Both are log-scaled because they span orders of magnitude, and the
+// inflow leads since it is what the ear is actually hearing.
+func busyness(inflow float64, mempoolCount int) float64 {
+	flow := logScale(inflow, 300, 6000)
+	backlog := logScale(float64(mempoolCount), 5000, 200000)
+	return 0.6*flow + 0.4*backlog
+}
+
+// logScale maps v in [lo, hi] onto [0, 1] logarithmically, clamping outside.
+func logScale(v, lo, hi float64) float64 {
+	if v <= lo {
+		return 0
+	}
+	if v >= hi {
+		return 1
+	}
+	return math.Log(v/lo) / math.Log(hi/lo)
+}
+
+func tempoForBusyness(busy float64) float64 {
+	return minTempoBPM + busy*(maxTempoBPM-minTempoBPM)
+}
+
+// updateTempo recomputes busyness from the latest data and eases the tempo
+// toward it. The first sample snaps so the view does not start from silence.
+func (m *model) updateTempo() {
+	m.audioBusy = busyness(m.inflow, m.overview.Mempool.Count)
+	target := tempoForBusyness(m.audioBusy)
+	if m.audioBPM == 0 {
+		m.audioBPM = target
+		return
+	}
+	m.audioBPM += (target - m.audioBPM) * 0.15
+}
+
+// audioTempo returns the current tempo and grid. The tempo tracks network
+// busyness unless OMPOOL_BPM pins it; OMPOOL_STEP sets steps per 4/4 bar
+// (default 8, eighth notes).
+func (m model) audioTempo() (bpm float64, stepsPerBar int, stepDur time.Duration) {
+	bpm = m.audioBPM
+	if bpm == 0 {
+		bpm = tempoForBusyness(0.3)
+	}
+	if v, err := strconv.ParseFloat(os.Getenv("OMPOOL_BPM"), 64); err == nil && v > 0 {
+		bpm = v
+	}
+	stepsPerBar = 8
+	if v, err := strconv.Atoi(os.Getenv("OMPOOL_STEP")); err == nil && v > 0 {
+		stepsPerBar = v
+	}
+	stepDur = time.Duration(float64(time.Minute) / bpm * 4 / float64(stepsPerBar))
+	return bpm, stepsPerBar, stepDur
+}
+
+func (m model) audioMode() bool {
+	return m.screen == moduleScreen && m.active.command == "audio"
+}
+
+// audioView packages what the audio export view draws beyond the overview.
+type audioView struct {
+	title       string
+	bpm, busy   float64
+	stepsPerBar int
+	step        int // current step within the bar
+	history     []float64
+	inflow      float64
+	mempool     int
+}
+
+func (m model) audioView() *audioView {
+	bpm, stepsPerBar, _ := m.audioTempo()
+	return &audioView{
+		title:       m.active.title,
+		bpm:         bpm,
+		busy:        m.audioBusy,
+		stepsPerBar: stepsPerBar,
+		step:        (m.audioStep + stepsPerBar - 1) % stepsPerBar,
+		history:     m.tempoHistory,
+		inflow:      m.inflow,
+		mempool:     m.overview.Mempool.Count,
+	}
+}
+
+// startAudioClock resets the grid so the first step lands one step from now.
+func (m *model) startAudioClock() tea.Cmd {
+	m.updateTempo()
+	_, _, stepDur := m.audioTempo()
+	m.audioGen++
+	m.audioStep = 0
+	m.audioNext = time.Now().Add(stepDur)
+	return scheduleAudioStep(m.audioGen, m.audioStep, m.audioNext)
+}
+
+func scheduleAudioStep(gen, step int, at time.Time) tea.Cmd {
+	return tea.Tick(max(time.Until(at), 0), func(time.Time) tea.Msg { return audioStepMsg{gen: gen, step: step} })
+}
+
+// pulseInterval is the frame time of the reveal highlight. In the audio view
+// the five-frame pulse is squeezed to finish inside a single grid step.
+func (m model) pulseInterval() time.Duration {
+	if m.audioMode() {
+		_, _, stepDur := m.audioTempo()
+		return stepDur / 6
+	}
+	return 90 * time.Millisecond
 }
 
 type overviewMsg struct {
@@ -187,6 +395,12 @@ func (m model) Init() tea.Cmd {
 	var cmds []tea.Cmd
 	if m.screen == moduleScreen && m.active.command != "viewer" {
 		cmds = append(cmds, moduleDataCommands(m.client, m.live, m.active.command))
+	}
+	if m.audioMode() {
+		cmds = append(cmds, scheduleAudioStep(m.audioGen, m.audioStep, m.audioNext))
+	}
+	if m.showsBlockStack() {
+		cmds = append(cmds, scheduleSpin(m.spinGen))
 	}
 	if m.wantsAnimation() {
 		cmds = append(cmds, scheduleTitleTick(m.animGen))
@@ -221,7 +435,7 @@ func (m *model) startLiveStream() {
 }
 
 func moduleNeedsLive(command string) bool {
-	return command == "overview" || command == "transactions" || command == "mempool"
+	return command == "overview" || command == "audio" || command == "transactions" || command == "mempool"
 }
 
 func moduleDataCommands(client *mempool.Client, live <-chan mempool.LiveStats, command string) tea.Cmd {
@@ -321,9 +535,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.overview.Blocks[0].ID != "" && msg.snapshot.Blocks[0].ID != m.overview.Blocks[0].ID
 			msg.snapshot.Recent = mergeRecentTransactions(msg.snapshot.Recent, m.overview.Recent, recentTransactionLimit)
 			m.overview = msg.snapshot
+			m.updateTempo()
+			m.sendStatsOSC()
 			if blockFound {
 				m.newBlockID = msg.snapshot.Blocks[0].ID
 				m.blockPulse = 8
+				block := msg.snapshot.Blocks[0]
+				m.osc.Send("/btc/block", float32(block.Height), float32(block.TxCount))
 			}
 		}
 		m.renderCache.invalidateOverview()
@@ -355,6 +573,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.HasFlow {
 			m.activity = append(m.activity, activitySample{at: now, value: msg.VBytesPerSecond})
 			m.renderCache.invalidateActivity()
+			m.inflow = msg.VBytesPerSecond
+			m.updateTempo()
+			m.sendStatsOSC()
 		}
 		if len(msg.Transactions) > 0 {
 			for i, tx := range msg.Transactions {
@@ -364,7 +585,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.txValues = append(m.txValues, transactionValueSample{at: at, value: float64(tx.Value) / 100_000_000})
 			}
 			m.pendingTX = enqueueTransactions(m.pendingTX, msg.Transactions, m.overview.Recent, 40)
-			if m.txPulse == 0 {
+			if m.txPulse == 0 && !m.audioMode() {
 				m.activateNextTransaction()
 			}
 		}
@@ -383,8 +604,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if valueFirst > 0 {
 			m.txValues = m.txValues[valueFirst:]
 		}
-		if m.txPulse > 0 {
-			return m, tea.Batch(waitForLiveStats(m.live), scheduleTXPulse())
+		if m.txPulse > 0 && !m.audioMode() {
+			return m, tea.Batch(waitForLiveStats(m.live), m.scheduleTXPulse())
 		}
 		return m, waitForLiveStats(m.live)
 	case txPulseMsg:
@@ -394,12 +615,45 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.txPulse == 0 {
 			m.newTXIDs = nil
-			m.activateNextTransaction()
+			if !m.audioMode() { // the audio view reveals on its own clock
+				m.activateNextTransaction()
+			}
 		}
 		if m.txPulse > 0 {
-			return m, scheduleTXPulse()
+			return m, m.scheduleTXPulse()
 		}
 		return m, nil
+	case spinTickMsg:
+		if msg.gen != m.spinGen || !m.showsBlockStack() {
+			return m, nil
+		}
+		m.spin++
+		m.renderCache.blocks.valid = false
+		return m, scheduleSpin(m.spinGen)
+	case audioStepMsg:
+		if msg.gen != m.audioGen || !m.audioMode() {
+			return m, nil
+		}
+		bpm, stepsPerBar, stepDur := m.audioTempo()
+		wasIdle := m.txPulse == 0
+		m.newTXIDs = nil
+		m.activateNextTransaction() // a rest if nothing is waiting
+		m.osc.Send("/btc/clock", float32(bpm), float32(msg.step%stepsPerBar), float32(stepsPerBar))
+		m.tempoHistory = append(m.tempoHistory, bpm)
+		if len(m.tempoHistory) > 400 { // ~2 minutes at eighth notes
+			m.tempoHistory = m.tempoHistory[len(m.tempoHistory)-400:]
+		}
+		m.renderCache.tempo.valid = false
+		m.audioStep = msg.step + 1
+		m.audioNext = m.audioNext.Add(stepDur)
+		if time.Until(m.audioNext) < -stepDur { // fell badly behind (suspend, stall): resync rather than burst
+			m.audioNext = time.Now().Add(stepDur)
+		}
+		cmds := []tea.Cmd{scheduleAudioStep(m.audioGen, m.audioStep, m.audioNext)}
+		if wasIdle && m.txPulse > 0 {
+			cmds = append(cmds, m.scheduleTXPulse())
+		}
+		return m, tea.Batch(cmds...)
 	case blockPulseMsg:
 		if m.blockPulse > 0 {
 			m.blockPulse--
@@ -487,6 +741,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.screen = pickerScreen
 			m.err = nil
+			m.spinGen++ // retire the block spinner
 			m.renderCache.invalidateAll()
 			return m, m.restartAnimation()
 		}
@@ -576,14 +831,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.loading = true
 		m.startLiveStream()
-		return m, moduleDataCommands(m.client, m.live, m.active.command)
+		cmds := []tea.Cmd{moduleDataCommands(m.client, m.live, m.active.command)}
+		if m.audioMode() {
+			cmds = append(cmds, m.startAudioClock())
+		}
+		if m.showsBlockStack() {
+			m.spinGen++
+			cmds = append(cmds, scheduleSpin(m.spinGen))
+		}
+		return m, tea.Batch(cmds...)
 	}
 
 	return m, nil
 }
 
 func moduleScrollsBlocks(command string) bool {
-	return command == "overview" || command == "blockchain" || command == "blocks"
+	return command == "overview" || command == "audio" || command == "blockchain" || command == "blocks"
 }
 
 func mergeRecentTransactions(incoming, existing []mempool.Transaction, limit int) []mempool.Transaction {
@@ -647,10 +910,20 @@ func (m *model) activateNextTransaction() {
 	m.newTXIDs = map[string]struct{}{tx.TxID: {}}
 	m.txPulse = 5
 	m.renderCache.transactions.valid = false
+
+	// The transaction becomes visible on this frame, so this is the moment an
+	// external instrument should sound it: value in sats, fee rate in sat/vB.
+	if m.osc != nil {
+		rate := float32(0)
+		if tx.VSize > 0 {
+			rate = float32(float64(tx.Fee) / tx.VSize)
+		}
+		m.osc.Send("/btc/tx", float32(tx.Value), rate)
+	}
 }
 
-func scheduleTXPulse() tea.Cmd {
-	return tea.Tick(90*time.Millisecond, func(time.Time) tea.Msg { return txPulseMsg{} })
+func (m model) scheduleTXPulse() tea.Cmd {
+	return tea.Tick(m.pulseInterval(), func(time.Time) tea.Msg { return txPulseMsg{} })
 }
 
 func scheduleBlockPulse() tea.Cmd {
@@ -695,7 +968,12 @@ func (m model) View() tea.View {
 	case m.overview.Fetched.IsZero():
 		view = tea.NewView(renderLoadingScreen(m.active, m.err, m.frame, width, height))
 	default:
-		view = tea.NewView(renderActiveModule(m.renderCache, m.active, m.overview, m.activity, m.txValues, m.loading, m.err, width, height, m.blockScroll, m.txPulse, m.newTXIDs, m.blockPulse, m.newBlockID))
+		m.renderCache.spinFrame = m.spin
+		if m.audioMode() && !m.overview.Fetched.IsZero() {
+			view = tea.NewView(renderOverviewCached(m.renderCache, m.overview, m.activity, m.loading, m.err, width, height, m.blockScroll, m.txPulse, m.newTXIDs, m.blockPulse, m.newBlockID, m.audioView()))
+		} else {
+			view = tea.NewView(renderActiveModule(m.renderCache, m.active, m.overview, m.activity, m.txValues, m.loading, m.err, width, height, m.blockScroll, m.txPulse, m.newTXIDs, m.blockPulse, m.newBlockID))
+		}
 	}
 	view.AltScreen = true
 	view.MouseMode = tea.MouseModeCellMotion
@@ -897,17 +1175,28 @@ func renderPanels(panels []panel) string {
 }
 
 func renderOverview(snapshot mempool.Overview, activity []activitySample, loading bool, err error, width, height, blockScroll, txPulse int, newTXIDs map[string]struct{}) string {
-	return renderOverviewCached(&overviewRenderCache{}, snapshot, activity, loading, err, width, height, blockScroll, txPulse, newTXIDs, 0, "")
+	return renderOverviewCached(&overviewRenderCache{}, snapshot, activity, loading, err, width, height, blockScroll, txPulse, newTXIDs, 0, "", nil)
 }
 
-func renderOverviewCached(cache *overviewRenderCache, snapshot mempool.Overview, activity []activitySample, loading bool, err error, width, height, blockScroll, txPulse int, newTXIDs map[string]struct{}, blockPulse int, newBlockID string) string {
+// renderOverviewCached draws the dashboard. audio is nil for the overview
+// itself; the audio export view passes its state so the header names it and
+// the tempo panel replaces the difficulty and fee panels.
+func renderOverviewCached(cache *overviewRenderCache, snapshot mempool.Overview, activity []activitySample, loading bool, err error, width, height, blockScroll, txPulse int, newTXIDs map[string]struct{}, blockPulse int, newBlockID string, audio *audioView) string {
+	title := ""
+	if audio != nil {
+		title = audio.title
+	}
 	if width < floorWidth || height < floorHeight {
 		return renderTooSmall(width, height)
 	}
 	l := newLayout(width, height)
 
-	header := cached(&cache.header, func() string { return renderStatusHeader(snapshot, loading, l) })
-	footer := labelText.Render(l.footer)
+	header := cached(&cache.header, func() string { return renderStatusHeader(snapshot, loading, l, title) })
+	footerText := l.footer
+	if audio != nil && l.content >= 58 {
+		footerText = fmt.Sprintf("%s  ·  ♩ %.0f bpm · %d/bar · osc", l.footer, audio.bpm, audio.stepsPerBar)
+	}
+	footer := labelText.Render(footerText)
 
 	if snapshot.Fetched.IsZero() {
 		return renderLoadingScreen(modules[0], err, 0, width, height)
@@ -927,7 +1216,7 @@ func renderOverviewCached(cache *overviewRenderCache, snapshot mempool.Overview,
 	gridHeight := height - l.padY - lipgloss.Height(header) - 1 - lipgloss.Height(metricRow) - 1 - 1
 	grid := ""
 	if gridHeight > 0 {
-		grid = renderGrid(cache, snapshot, activity, l, gridHeight, blockScroll, txPulse, newTXIDs, blockPulse, newBlockID)
+		grid = renderGrid(cache, snapshot, activity, l, gridHeight, blockScroll, txPulse, newTXIDs, blockPulse, newBlockID, audio)
 	}
 
 	sections := []string{header, metricRow}
@@ -1071,7 +1360,7 @@ func packLine(parts []string, separator string, width int) []string {
 	return lines
 }
 
-func renderStatusHeader(snapshot mempool.Overview, loading bool, l layout) string {
+func renderStatusHeader(snapshot mempool.Overview, loading bool, l layout, title string) string {
 	status := valueText.Render("● LIVE")
 	if loading {
 		status = labelText.Render("◌ REFRESHING")
@@ -1085,6 +1374,9 @@ func renderStatusHeader(snapshot mempool.Overview, loading bool, l layout) strin
 		}
 	}
 	brand := headerText.Render("OMPOOL")
+	if title != "" {
+		brand += labelText.Render("  / ") + headerText.Render(strings.ToUpper(title))
+	}
 	lefts := []string{
 		brand + "  " + labelText.Render("BITCOIN MAINNET / OVERVIEW"),
 		brand + "  " + labelText.Render("OVERVIEW"),
@@ -1109,7 +1401,7 @@ func widestHeaderPair(lefts, rights []string, width int) (string, string) {
 	return lefts[len(lefts)-1], rights[len(rights)-1]
 }
 
-func renderGrid(cache *overviewRenderCache, snapshot mempool.Overview, activity []activitySample, l layout, height, scroll, txPulse int, newTXIDs map[string]struct{}, blockPulse int, newBlockID string) string {
+func renderGrid(cache *overviewRenderCache, snapshot mempool.Overview, activity []activitySample, l layout, height, scroll, txPulse int, newTXIDs map[string]struct{}, blockPulse int, newBlockID string, audio *audioView) string {
 	blocks := panel{
 		min:      minPanelHeight,
 		height:   7,
@@ -1128,18 +1420,17 @@ func renderGrid(cache *overviewRenderCache, snapshot mempool.Overview, activity 
 	if l.twoColumn {
 		left := blocks
 		left.height = height
-		right := renderPanelColumn(cache, snapshot, activity, l, l.rightWidth, height, txPulse, newTXIDs, nil)
+		right := renderPanelColumn(cache, snapshot, activity, l, l.rightWidth, height, txPulse, newTXIDs, nil, audio)
 		return lipgloss.JoinHorizontal(lipgloss.Top, left.render(left.height), strings.Repeat(" ", l.columnGap), right)
 	}
-	return renderPanelColumn(cache, snapshot, activity, l, l.content, height, txPulse, newTXIDs, &blocks)
+	return renderPanelColumn(cache, snapshot, activity, l, l.content, height, txPulse, newTXIDs, &blocks, audio)
 }
 
 // renderPanelColumn stacks the data panels into height rows, including the
-// block stack at the top when there is no second column to put it in.
-func renderPanelColumn(cache *overviewRenderCache, snapshot mempool.Overview, activity []activitySample, l layout, width, height, txPulse int, newTXIDs map[string]struct{}, blocks *panel) string {
+// block stack at the top when there is no second column to put it in. The
+// audio view swaps the difficulty and fee panels for the tempo panel.
+func renderPanelColumn(cache *overviewRenderCache, snapshot mempool.Overview, activity []activitySample, l layout, width, height, txPulse int, newTXIDs map[string]struct{}, blocks *panel, audio *audioView) string {
 	activityPanel := cached(&cache.activity, func() string { return renderActivityPanel(activity, l, width) })
-	difficultyPanel := cached(&cache.difficulty, func() string { return renderDifficultyPanel(snapshot.Difficulty, l, width) })
-	feePanel := cached(&cache.fees, func() string { return renderFeeMarket(snapshot.Fees, snapshot.Prices.USD, l, width) })
 
 	fixed := func(content string, priority int) panel {
 		return panel{height: lipgloss.Height(content), min: lipgloss.Height(content), priority: priority,
@@ -1150,10 +1441,16 @@ func renderPanelColumn(cache *overviewRenderCache, snapshot mempool.Overview, ac
 	if blocks != nil {
 		panels = append(panels, *blocks)
 	}
+	panels = append(panels, fixed(activityPanel, 72))
+	if audio != nil {
+		tempoPanel := cached(&cache.tempo, func() string { return renderTempoPanel(audio, l, width) })
+		panels = append(panels, fixed(tempoPanel, 70))
+	} else {
+		difficultyPanel := cached(&cache.difficulty, func() string { return renderDifficultyPanel(snapshot.Difficulty, l, width) })
+		feePanel := cached(&cache.fees, func() string { return renderFeeMarket(snapshot.Fees, snapshot.Prices.USD, l, width) })
+		panels = append(panels, fixed(difficultyPanel, 50), fixed(feePanel, 70))
+	}
 	panels = append(panels,
-		fixed(activityPanel, 72),
-		fixed(difficultyPanel, 50),
-		fixed(feePanel, 70),
 		panel{
 			min: minPanelHeight, height: 8, priority: 75, grow: true,
 			render: func(panelHeight int) string {
@@ -1185,9 +1482,9 @@ func renderBlockStack(cache *overviewRenderCache, projected []mempool.ProjectedB
 
 	var lines []string
 	if l.blockCards {
-		lines = blockCardLines(projected, confirmed, width, blockPulse, newBlockID)
+		lines = blockCardLines(projected, confirmed, width, blockPulse, newBlockID, cache.spinFrame)
 	} else {
-		lines = blockRowLines(projected, confirmed, width, blockPulse, newBlockID)
+		lines = blockRowLines(projected, confirmed, width, blockPulse, newBlockID, cache.spinFrame)
 	}
 
 	maxScroll := max(0, len(lines)-visible)
@@ -1219,14 +1516,14 @@ func appendIfItFits(base, extra string, width int) string {
 	return base + "  " + extra
 }
 
-func blockCardLines(projected []mempool.ProjectedBlock, confirmed []mempool.Block, width, blockPulse int, newBlockID string) []string {
+func blockCardLines(projected []mempool.ProjectedBlock, confirmed []mempool.Block, width, blockPulse int, newBlockID string, spin int) []string {
 	cardWidth := max(1, width-4)
 	// The card's usable width, inside its border and padding.
 	inner := max(1, cardWidth-4)
 	const cardHeight = 6
 	items := make([]string, 0, len(projected)+len(confirmed)+1)
 	for _, b := range projected {
-		body := valueText.Render(fmt.Sprintf("~%.1f sat/vB", b.MedianFee)) + "  " + labelText.Render("median") + "\n" +
+		body := valueText.Render(spinner(spin)+" "+fmt.Sprintf("~%.1f sat/vB", b.MedianFee)) + "  " + labelText.Render("median") + "\n" +
 			capacityGauge(projectedFullness(b), inner, valueText) + "\n" +
 			labelText.Render(ellipsize(projectedFeeRange(b), inner)) + "\n" +
 			headerText.Render(formatBytes(int64(b.BlockVSize), "vB")) + "  " +
@@ -1301,21 +1598,23 @@ func capacityGauge(fullness float64, width int, style lipgloss.Style) string {
 // blockRowLines is the single-column form of the stack: one line per block, so
 // a short terminal still shows the shape of the chain rather than two cards.
 // Columns are dropped from the right as the panel narrows.
-func blockRowLines(projected []mempool.ProjectedBlock, confirmed []mempool.Block, width, blockPulse int, newBlockID string) []string {
+func blockRowLines(projected []mempool.ProjectedBlock, confirmed []mempool.Block, width, blockPulse int, newBlockID string, spin int) []string {
 	inner := max(1, width-4)
 	// A compact gauge joins the row once the panel is wide enough for it.
 	const gaugeWidth = 13
 	lines := make([]string, 0, len(projected)+len(confirmed)+1)
 	for _, b := range projected {
 		right := ""
-		if inner >= 24 {
+		if inner >= 26 {
 			right = labelText.Render(padLeft(formatBytes(int64(b.BlockVSize), "vB"), 9))
 		}
-		if inner >= 34 {
+		if inner >= 36 {
 			right += "  " + labelText.Render(padLeft(formatInt(int64(b.TxCount))+" tx", 9))
 		}
-		left := valueText.Render(pad(fmt.Sprintf("~%.1f sat/vB", b.MedianFee), 13))
-		if inner >= 30+gaugeWidth {
+		// the spinner says "still being mined"; it sits where a confirmed
+		// block shows its height marker
+		left := valueText.Render(spinner(spin)) + " " + valueText.Render(pad(fmt.Sprintf("~%.1f sat/vB", b.MedianFee), 13))
+		if inner >= 32+gaugeWidth {
 			left += "  " + capacityGauge(projectedFullness(b), gaugeWidth, valueText)
 		}
 		lines = append(lines, justify(left, right, inner))
@@ -1388,6 +1687,56 @@ func confirmedDivider(width int) string {
 	const label = " CONFIRMED "
 	rule := max(2, width-len(label))
 	return labelText.Render(strings.Repeat("─", rule/2) + label + strings.Repeat("─", rule-rule/2))
+}
+
+// renderTempoPanel shows the network-driven tempo: the current bpm on a
+// 70..160 gauge, a beat indicator that walks the bar, a short history, and the
+// two inputs that set it.
+func renderTempoPanel(audio *audioView, l layout, width int) string {
+	inner := max(1, width-4)
+	barWidth := max(4, inner-2)
+	position := (audio.bpm - minTempoBPM) / (maxTempoBPM - minTempoBPM)
+	filled := int(math.Round(math.Max(0, math.Min(1, position)) * float64(barWidth)))
+	gauge := valueText.Render(strings.Repeat("█", filled)) + labelText.Render(strings.Repeat("░", barWidth-filled))
+	scale := truncate(labelText.Render(fmt.Sprintf("%.0f", minTempoBPM))+
+		strings.Repeat(" ", max(1, barWidth-6))+
+		labelText.Render(fmt.Sprintf("%.0f", maxTempoBPM)), inner)
+
+	var beat strings.Builder
+	for i := range audio.stepsPerBar {
+		if i == audio.step {
+			beat.WriteString(valueText.Render("●"))
+		} else {
+			beat.WriteString(labelText.Render("○"))
+		}
+	}
+
+	title := headerText.Render("TEMPO") + "  " + valueText.Render(fmt.Sprintf("%.0f bpm", audio.bpm)) +
+		"  " + labelText.Render(fmt.Sprintf("busy %.0f%%", audio.busy*100)) + "  " + beat.String()
+	lines := []string{truncate(title, inner), gauge, scale}
+	if l.chartHeight >= 9 && len(audio.history) > 1 {
+		lines = append(lines, tempoSparkline(audio.history, inner))
+	}
+	lines = append(lines, packLine([]string{
+		labelText.Render(fmt.Sprintf("%.0f vB/s in", audio.inflow)),
+		labelText.Render(formatInt(int64(audio.mempool)) + " tx waiting"),
+		labelText.Render(fmt.Sprintf("%d/bar", audio.stepsPerBar)),
+	}, labelText.Render("  ·  "), inner)...)
+	return panelStyle.Width(width).Render(strings.Join(lines, "\n"))
+}
+
+// tempoSparkline draws bpm history against the fixed 70..160 range so the same
+// tempo always sits at the same height.
+func tempoSparkline(history []float64, width int) string {
+	blocks := []rune("▁▂▃▄▅▆▇█")
+	var out strings.Builder
+	for column := range width {
+		index := min(len(history)-1, column*len(history)/width)
+		position := (history[index] - minTempoBPM) / (maxTempoBPM - minTempoBPM)
+		level := int(math.Round(math.Max(0, math.Min(1, position)) * float64(len(blocks)-1)))
+		out.WriteRune(blocks[level])
+	}
+	return valueText.Render(out.String())
 }
 
 func renderDifficultyPanel(difficulty mempool.DifficultyAdjustment, l layout, width int) string {

@@ -17,7 +17,13 @@ func renderActiveModule(cache *overviewRenderCache, active module, snapshot memp
 		return renderTransactionViewer(transactionViewerState{}, width, height)
 	}
 	if active.command == "overview" {
-		return renderOverviewCached(cache, snapshot, activity, loading, err, width, height, blockScroll, txPulse, newTXIDs, blockPulse, newBlockID)
+		return renderOverviewCached(cache, snapshot, activity, loading, err, width, height, blockScroll, txPulse, newTXIDs, blockPulse, newBlockID, nil)
+	}
+	if active.command == "audio" {
+		// The live model renders this view itself with its clock state; this
+		// path only serves callers without one.
+		return renderOverviewCached(cache, snapshot, activity, loading, err, width, height, blockScroll, txPulse, newTXIDs, blockPulse, newBlockID,
+			&audioView{title: active.title, bpm: tempoForBusyness(0.3), stepsPerBar: 8, mempool: snapshot.Mempool.Count})
 	}
 	if width < floorWidth || height < floorHeight {
 		return renderTooSmall(width, height)

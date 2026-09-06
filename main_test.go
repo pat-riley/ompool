@@ -352,6 +352,9 @@ func moduleByCommand(command string) module {
 func TestDedicatedModulesFitResponsiveTerminals(t *testing.T) {
 	sizes := []struct{ width, height int }{{160, 50}, {120, 40}, {96, 30}, {80, 24}, {60, 20}, {40, 14}, {30, 8}}
 	for _, candidate := range modules[1:] {
+		if candidate.command == "audio" {
+			continue // renders through the overview, which this test excludes
+		}
 		for _, size := range sizes {
 			view := renderActiveModule(&overviewRenderCache{}, candidate, sampleOverview(), nil, nil, false, nil, size.width, size.height, 0, 0, nil, 0, "")
 			if lipgloss.Width(view) != size.width || lipgloss.Height(view) != size.height {
