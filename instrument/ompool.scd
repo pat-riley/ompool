@@ -12,9 +12,10 @@
 //
 // DATA -> MUSIC MAP
 //   EVERY transaction                     -> one plucked "ping" (on ompool's grid, or instantly)
-//   tx value (sats)                       -> pitch across three octaves: small amounts high, whales low; also loudness,
-//                                            ring length and reverb; >= 1 BTC adds a deep bell an octave below
-//   tx fee rate vs. market rate           -> brightness (urgent = bright) and pan (cheap = left, urgent = right)
+//   tx fee rate vs. market rate           -> pitch across three octaves: cheap = low, market rate = middle, urgent = high;
+//                                            also brightness (urgent = bright) and pan (cheap = left, urgent = right)
+//   tx value (sats)                       -> loudness, ring length and reverb (big amounts ring in more space);
+//                                            >= 1 BTC adds a deep bell an octave below
 //   a tx paying > 3x market               -> snare ratchet (an "urgent" glitch)
 //   new block                             -> gong + chord change (steps the progression)
 //   block tx count                        -> gong brightness
@@ -231,7 +232,7 @@ s.waitForBoot({
 		var pool = ~pool.(~chord.());
 		var ratio = (tx.feeRate / ~market).clip(0.25, 6);          // how urgent vs. the market
 		var size = tx.sats.max(1).log10.clip(3, 9);                // 1k sats .. 10 BTC, six decades
-		var idx = size.linlin(3, 9, pool.size - 1, 0).round.asInteger;   // VALUE -> pitch: small = high, whale = low
+		var idx = ratio.explin(0.25, 6, 0, pool.size - 1).round.asInteger;   // FEE -> pitch: cheap = low, market = middle, urgent = high
 		var pan = ratio.explin(0.25, 6, -0.7, 0.7) + 0.1.rand2;   // fee: cheap = left, urgent = right
 		var bright = ratio.explin(0.25, 6, 0.2, 0.7);              // fee: cheap = soft/dull, urgent = bright
 		var wet = size.linlin(3, 9, 0.25, 0.7);                    // big amounts ring in more space

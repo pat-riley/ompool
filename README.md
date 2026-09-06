@@ -3,8 +3,8 @@
 A live Bitcoin mempool and blockchain dashboard for the terminal, with an
 optional SuperCollider instrument that plays the network as it happens.
 
-Every transaction entering the mempool becomes a plucked note: small amounts
-high, whales low, cheap fees left, urgent fees right. New blocks land as a gong
+Every transaction entering the mempool becomes a plucked note: cheap fees low,
+urgent fees high, big amounts ringing longer and louder. New blocks land as a gong
 and step a chord progression. Fee pressure sets the harmonic tension, mempool
 inflow sets the drum density, and the tempo itself follows how busy the network
 is.
