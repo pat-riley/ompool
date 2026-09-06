@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
@@ -1146,5 +1147,32 @@ func TestCapacityGaugeFillsCellByCell(t *testing.T) {
 	}
 	if narrow := plain(capacityGauge(0.5, 6, confirmedText)); narrow != " 50%" {
 		t.Fatalf("a gauge too narrow for cells should fall back to the percentage, got %q", narrow)
+	}
+}
+
+func TestPickerAlignsEveryDescriptionAtEightyColumns(t *testing.T) {
+	view := plain(renderPicker(0, 0, 80, 24))
+	column := -1
+	for _, item := range homeModules() {
+		line := ""
+		for _, candidate := range strings.Split(view, "\n") {
+			if strings.Contains(candidate, item.title+" ") {
+				line = candidate
+				break
+			}
+		}
+		if line == "" {
+			t.Fatalf("picker is missing %q", item.title)
+		}
+		at := strings.Index(line, item.description)
+		if at < 0 {
+			t.Fatalf("description for %q is cut or missing in %q", item.title, line)
+		}
+		at = utf8.RuneCountInString(line[:at]) // the cursor marker is multi-byte
+		if column < 0 {
+			column = at
+		} else if at != column {
+			t.Fatalf("description for %q starts at %d, others at %d", item.title, at, column)
+		}
 	}
 }
