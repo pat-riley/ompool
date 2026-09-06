@@ -3,6 +3,11 @@
 A live Bitcoin mempool and blockchain dashboard for the terminal, with an
 optional SuperCollider instrument that plays the network as it happens.
 
+![ompool's audio view: the live dashboard with the Tempo panel](docs/ompool-audio.gif)
+
+[Watch it with sound](https://x.com/_rileyio/status/2096373222153351193/video/1),
+or see a [still](docs/ompool-audio.png).
+
 Every transaction entering the mempool becomes a plucked note: small amounts
 high, whales low, cheap fees left, urgent fees right. New blocks land as a gong
 and step a chord progression. Fee pressure sets the harmonic tension, mempool
