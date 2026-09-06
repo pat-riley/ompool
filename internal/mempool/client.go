@@ -12,6 +12,9 @@ import (
 
 const DefaultBaseURL = "https://mempool.space/api"
 
+// UserAgent identifies ompool to the API. main sets it to include the version.
+var UserAgent = "ompool"
+
 type Client struct {
 	baseURL string
 	http    *http.Client
@@ -341,7 +344,7 @@ func (c *Client) get(ctx context.Context, path string, target *[]byte) error {
 		return err
 	}
 	req.Header.Set("Accept", "text/plain")
-	req.Header.Set("User-Agent", "ompool/dev")
+	req.Header.Set("User-Agent", UserAgent)
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -362,7 +365,7 @@ func (c *Client) getJSON(ctx context.Context, path string, target any) error {
 		return err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("User-Agent", "ompool/dev")
+	req.Header.Set("User-Agent", UserAgent)
 
 	resp, err := c.http.Do(req)
 	if err != nil {

@@ -44,6 +44,7 @@ ompool transactions    live transactions entering the mempool
 ompool viewer          inspect a transaction, its UTXOs, hex, and embedded data
 ompool mempool         backlog, weight, and activity
 ompool mining          hashrate, rewards, and pool distribution
+ompool version         print the version
 ```
 
 Press `Esc` to return to the picker and `q` to quit. Dashboard modules fetch a
@@ -124,8 +125,12 @@ go test ./...
 ./scripts/dev overview   # rebuild and relaunch on every save (Linux, needs inotify-tools)
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Releases are cut by pushing a `v*`
-tag; GitHub Actions builds the binaries.
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Versions follow [semantic versioning](https://semver.org) and live only in git
+tags. Pushing a `v*` tag makes GitHub Actions build the binaries, stamp the tag
+into `ompool version` and the title screen, and publish a release. Builds from
+a checkout report `dev` and the commit instead.
 
 ## License
 
