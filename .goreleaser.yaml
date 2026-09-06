@@ -20,4 +20,5 @@ checksum:
   name_template: checksums.txt
 
 changelog:
-  use: github
+  # GitHub's generated notes: one line per merged pull request.
+  use: github-native
