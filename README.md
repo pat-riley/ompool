@@ -9,6 +9,9 @@ and step a chord progression. Fee pressure sets the harmonic tension, mempool
 inflow sets the drum density, and the tempo itself follows how busy the network
 is.
 
+ompool is early alpha software: expect rough edges, and expect the sound to
+change between releases.
+
 ## Install
 
 With Go 1.27 or newer:
